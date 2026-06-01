@@ -148,7 +148,7 @@ function App() {
   const [timerSoundEnabled, setTimerSoundEnabled] = useState(true);
   const [bgmTrackId, setBgmTrackId] = useState<BgmTrackId>("main");
   const [bgmEnabled, setBgmEnabled] = useState(true);
-  const [bgmVolume, setBgmVolume] = useState(0.12);
+  const [bgmVolume, setBgmVolume] = useState(0.05);
 
   function formatNow() {
     return new Date().toLocaleTimeString("ja-JP", {
@@ -2422,7 +2422,7 @@ function App() {
         <p style={{ margin: "8px 0 0", color: "#bbb", fontSize: 13 }}>
           BGMは全員に同期されます。各端末が同じ音源を再生し、音量だけ各自で調整します。
           <code>public/bgm/main.mp3</code>、<code>public/bgm/calm.mp3</code>、<code>public/bgm/review.mp3</code> を置いてください。
-          50手目から終盤戦BGM、感想戦・対局終了時は感想戦BGMへ自動で切り替わります。
+          感想戦・対局終了時は感想戦BGMへ自動で切り替わります。
         </p>
 
         {getSelectedBgmTrack().url && <audio ref={bgmAudioRef} src={getSelectedBgmTrack().url} loop preload="auto" />}
