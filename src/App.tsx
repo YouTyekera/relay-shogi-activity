@@ -34,6 +34,9 @@ type MoveRecord = {
   playerName: string;
   text: string;
   capturedPieceName?: PieceName;
+  from?: SquarePos;
+  to?: SquarePos;
+  kind?: "move" | "drop" | "skip";
 };
 type TurnInfo = {
   moveNumber: number;
@@ -107,6 +110,8 @@ function App() {
   const [message, setMessage] = useState("");
   const [testFreeMoveMode, setTestFreeMoveMode] = useState(false);
   const [pendingPromotion, setPendingPromotion] = useState<PendingPromotion | null>(null);
+  const [turnStartedAt, setTurnStartedAt] = useState(Date.now());
+  const [timerNow, setTimerNow] = useState(Date.now());
   const [pendingConfirm, setPendingConfirm] = useState<"resign" | "reset" | "skip" | null>(null);
   const [pendingResignSide, setPendingResignSide] = useState<TeamSide | null>(null);
   const [soundEnabled, setSoundEnabled] = useState(true);
@@ -216,6 +221,22 @@ function App() {
 
     return () => {
       socket.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (gameStatus === "playing") {
+      setTurnStartedAt(Date.now());
+    }
+  }, [moveCount, gameStatus]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setTimerNow(Date.now());
+    }, 500);
+
+    return () => {
+      window.clearInterval(timer);
     };
   }, []);
 
@@ -957,6 +978,7 @@ function App() {
         side: currentTurn.side,
         playerName: skippedPlayerName,
         text: "手番スキップ",
+        kind: "skip",
       },
       ...moveHistory,
     ];
@@ -1231,7 +1253,7 @@ function App() {
     const finish = finishMessageAfterMove(newBoard, newHands, movingPiece.side, targetPiece);
     const kifuText = `${formatSquareForKifu(to)}${movingPiece.name}${promote ? "成" : ""}`;
     const newMoveHistory: MoveRecord[] = [
-      { moveNumber: currentTurn.moveNumber, side: currentTurn.side, playerName: getDisplayName(currentTurn.player), text: kifuText, capturedPieceName: targetPiece?.name },
+      { moveNumber: currentTurn.moveNumber, side: currentTurn.side, playerName: getDisplayName(currentTurn.player), text: kifuText, capturedPieceName: targetPiece?.name, from, to, kind: "move" },
       ...moveHistory,
     ];
     const newMoveCount = moveCount + 1;
@@ -1345,7 +1367,7 @@ function App() {
     newHands[selectedHandPiece.side].splice(handIndex, 1);
     const finish = finishMessageAfterMove(newBoard, newHands, selectedHandPiece.side, null);
     const newMoveHistory: MoveRecord[] = [
-      { moveNumber: currentTurn.moveNumber, side: currentTurn.side, playerName: getDisplayName(currentTurn.player), text: `${formatSquareForKifu(to)}${selectedHandPiece.name}打` },
+      { moveNumber: currentTurn.moveNumber, side: currentTurn.side, playerName: getDisplayName(currentTurn.player), text: `${formatSquareForKifu(to)}${selectedHandPiece.name}打`, to, kind: "drop" },
       ...moveHistory,
     ];
     const newMoveCount = moveCount + 1;
@@ -1449,6 +1471,25 @@ function App() {
     }
 
     return cells;
+  }
+
+  function isLastMoveDestination(row: number, col: number) {
+    const lastMove = moveHistory[0];
+
+    if (!lastMove?.to) {
+      return false;
+    }
+
+    return lastMove.to.row === row && lastMove.to.col === col;
+  }
+
+  function getTurnRemainingSeconds() {
+    if (gameStatus !== "playing") {
+      return 30;
+    }
+
+    const elapsedSeconds = Math.floor((timerNow - turnStartedAt) / 1000);
+    return Math.max(0, 30 - elapsedSeconds);
   }
   const hostControlDisabled = !isCurrentUserHost();
 
@@ -1751,6 +1792,75 @@ function App() {
         <div style={{ marginTop: 6 }}>
           {lastMove.moveNumber}手目 / {getSideLabel(lastMove.side)} / {lastMove.playerName} / {lastMove.text}
           {lastMove.capturedPieceName ? `（${lastMove.capturedPieceName}を取得）` : ""}
+        </div>
+      </div>
+    );
+  }
+
+  function BoardTurnHeader() {
+    if (gameStatus === "finished") {
+      return (
+        <div
+          style={{
+            width: 396,
+            margin: "0 auto 8px",
+            padding: "10px 12px",
+            borderRadius: 10,
+            border: "2px solid #ffd166",
+            background: "#2f2a1f",
+            boxSizing: "border-box",
+          }}
+        >
+          <strong>対局終了</strong>
+          <div style={{ marginTop: 4, fontSize: 13 }}>{message || "対局が終了しました。"}</div>
+        </div>
+      );
+    }
+
+    if (currentTurn === null) {
+      return (
+        <div
+          style={{
+            width: 396,
+            margin: "0 auto 8px",
+            padding: "10px 12px",
+            borderRadius: 10,
+            border: "2px solid #aa4444",
+            background: "#332424",
+            boxSizing: "border-box",
+          }}
+        >
+          <strong>手番情報エラー</strong>
+          <div style={{ marginTop: 4, fontSize: 13 }}>ロビーに戻ると復旧できます。</div>
+        </div>
+      );
+    }
+
+    const canMove = testFreeMoveMode || (currentUser !== null && currentTurn.player.id === currentUser.id);
+    const remainingSeconds = getTurnRemainingSeconds();
+
+    return (
+      <div
+        style={{
+          width: 396,
+          margin: "0 auto 8px",
+          padding: "10px 12px",
+          borderRadius: 10,
+          border: `2px solid ${canMove ? "#7ee787" : currentTurn.side === "black" ? "#f0c978" : "#7b9cff"}`,
+          background: canMove ? "#1f3325" : "#24262b",
+          boxSizing: "border-box",
+        }}
+      >
+        <div style={{ fontWeight: "bold", marginBottom: 6 }}>
+          {canMove ? "あなたの手番です" : "現在の手番"}
+        </div>
+        <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <span>{currentTurn.moveNumber}手目</span>
+          <span>{getSideLabel(currentTurn.side)}</span>
+          <PlayerCard participant={currentTurn.player} side={currentTurn.side} compact />
+        </div>
+        <div style={{ marginTop: 6, color: remainingSeconds === 0 ? "#ff8b8b" : "#ddd", fontSize: 13 }}>
+          目安時間: {remainingSeconds}秒 / 超過しても罰則はありません
         </div>
       </div>
     );
@@ -2274,35 +2384,69 @@ function App() {
                 盤面表示: {viewerBottomSide === "black" ? "先手を下に表示" : "後手を下に表示"}
               </p>
 
-              <div style={{ display: "flex", justifyContent: "center", gap: 24, alignItems: "flex-start", marginTop: 16 }}>
-                <section style={{ minWidth: 120 }}>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "150px 396px 150px",
+                  justifyContent: "center",
+                  gap: 24,
+                  alignItems: "start",
+                  marginTop: 16,
+                  minHeight: 470,
+                }}
+              >
+                <section style={{ width: 150, minHeight: 420 }}>
                   <h3>{getSideLabel(upperHandSide)} 持ち駒</h3>
                   <HandArea side={upperHandSide} hand={hands[upperHandSide]} />
                 </section>
 
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(9, 44px)", justifyContent: "center", border: "2px solid #d6a85c" }}>
-                  {getDisplayBoardCells().map(({ row, col, square }) => (
-                    <button
-                      key={`${row}-${col}`}
-                      onClick={() => handleSquareClick(row, col)}
-                      style={{
-                        width: 44,
-                        height: 44,
-                        border: "1px solid #8b5a2b",
-                        background: isSelected(row, col) ? "#f7d774" : "#f0c978",
-                        color: square?.side === "black" ? "#111" : "#7b1e1e",
-                        fontWeight: "bold",
-                        fontSize: 18,
-                        cursor: gameStatus === "playing" ? "pointer" : "not-allowed",
-                        transform: square && square.side !== viewerBottomSide ? "rotate(180deg)" : "none",
-                      }}
-                    >
-                      {square ? square.name : ""}
-                    </button>
-                  ))}
-                </div>
+                <section style={{ width: 396 }}>
+                  <BoardTurnHeader />
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(9, 44px)",
+                      gridTemplateRows: "repeat(9, 44px)",
+                      width: 396,
+                      height: 396,
+                      justifyContent: "center",
+                      border: "2px solid #d6a85c",
+                      boxSizing: "content-box",
+                    }}
+                  >
+                    {getDisplayBoardCells().map(({ row, col, square }) => {
+                      const isLastDestination = isLastMoveDestination(row, col);
 
-                <section style={{ minWidth: 120 }}>
+                      return (
+                        <button
+                          key={`${row}-${col}`}
+                          onClick={() => handleSquareClick(row, col)}
+                          style={{
+                            width: 44,
+                            height: 44,
+                            border: isLastDestination ? "2px solid #4caf6a" : "1px solid #8b5a2b",
+                            background: isSelected(row, col)
+                              ? "#f7d774"
+                              : isLastDestination
+                                ? "#bfe8b6"
+                                : "#f0c978",
+                            boxShadow: isLastDestination ? "inset 0 0 0 999px rgba(46, 160, 67, 0.18)" : "none",
+                            color: square?.side === "black" ? "#111" : "#7b1e1e",
+                            fontWeight: "bold",
+                            fontSize: 18,
+                            cursor: gameStatus === "playing" ? "pointer" : "not-allowed",
+                            transform: square && square.side !== viewerBottomSide ? "rotate(180deg)" : "none",
+                            boxSizing: "border-box",
+                          }}
+                        >
+                          {square ? square.name : ""}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+
+                <section style={{ width: 150, minHeight: 420 }}>
                   <h3>{getSideLabel(lowerHandSide)} 持ち駒</h3>
                   <HandArea side={lowerHandSide} hand={hands[lowerHandSide]} />
                 </section>
