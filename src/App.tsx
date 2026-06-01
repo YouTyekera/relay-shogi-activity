@@ -9,12 +9,13 @@ const discordSdk = isDiscordActivity ? new DiscordSDK(CLIENT_ID) : null;
 const DEFAULT_TURNS_PER_PLAYER = 1;
 const SOCKET_URL = "";
 
-type BgmTrackId = "none" | "main" | "calm";
+type BgmTrackId = "none" | "main" | "calm" | "review";
 
 const BGM_TRACKS: { id: BgmTrackId; label: string; url: string }[] = [
   { id: "none", label: "なし", url: "" },
   { id: "main", label: "通常BGM", url: "/bgm/main.mp3" },
-  { id: "calm", label: "BGM", url: "/bgm/calm.mp3" },
+  { id: "calm", label: "終盤戦BGM", url: "/bgm/calm.mp3" },
+  { id: "review", label: "感想戦BGM", url: "/bgm/review.mp3" },
 ];
 
 type Participant = {
@@ -73,6 +74,9 @@ type SyncState = {
   turnsPerPlayer: number;
   bgmTrackId?: BgmTrackId;
   bgmEnabled?: boolean;
+  reviewIndex?: number | null;
+  activeTurnSide?: TeamSide | null;
+  activeTurnPlayerId?: string | null;
 };
 
 function createInitialBoard(): Board {
@@ -137,13 +141,14 @@ function App() {
   const [lastSyncedAt, setLastSyncedAt] = useState("");
   const [roomUserIds, setRoomUserIds] = useState<string[]>([]);
   const [turnsPerPlayer, setTurnsPerPlayer] = useState(DEFAULT_TURNS_PER_PLAYER);
+  const [activeTurnSide, setActiveTurnSide] = useState<TeamSide | null>(null);
+  const [activeTurnPlayerId, setActiveTurnPlayerId] = useState<string | null>(null);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
   const [showHelpPanel, setShowHelpPanel] = useState(false);
   const [timerSoundEnabled, setTimerSoundEnabled] = useState(true);
-  const [bgmTrackId, setBgmTrackId] = useState<BgmTrackId>("none");
-  const [bgmEnabled, setBgmEnabled] = useState(false);
-  const [bgmVolume, setBgmVolume] = useState(0.35);
-  const [teamMuteNoticeEnabled, setTeamMuteNoticeEnabled] = useState(false);
+  const [bgmTrackId, setBgmTrackId] = useState<BgmTrackId>("main");
+  const [bgmEnabled, setBgmEnabled] = useState(true);
+  const [bgmVolume, setBgmVolume] = useState(0.12);
 
   function formatNow() {
     return new Date().toLocaleTimeString("ja-JP", {
@@ -266,8 +271,17 @@ function App() {
     urgentGainRef.current = null;
   }
 
+  function getEffectiveBgmTrackId(): BgmTrackId {
+    if (!bgmEnabled) return "none";
+    if (reviewIndex !== null) return "review";
+    if (gameStatus === "playing" && moveCount >= 50) return "calm";
+    if (gameStatus === "finished") return "review";
+    return "main";
+  }
+
   function getSelectedBgmTrack() {
-    return BGM_TRACKS.find((track) => track.id === bgmTrackId) ?? BGM_TRACKS[0];
+    const effectiveTrackId = getEffectiveBgmTrackId();
+    return BGM_TRACKS.find((track) => track.id === effectiveTrackId) ?? BGM_TRACKS[0];
   }
 
   async function applyBgmPlayback(nextEnabled: boolean, nextTrackId: BgmTrackId) {
@@ -284,33 +298,16 @@ function App() {
       return;
     }
 
+    if (!audio.src.includes(track.url)) {
+      audio.src = track.url;
+      audio.load();
+    }
+
     try {
       await audio.play();
     } catch {
-      setMessage("BGMの自動再生がブロックされました。BGM再生ボタンをもう一度押してください。");
+      setMessage("BGMの自動再生がブロックされました。必要ならBGM再開を押してください。");
     }
-  }
-
-  function changeBgmTrack(nextTrackId: BgmTrackId) {
-    if (!isCurrentUserHost()) {
-      setMessage("BGM設定はホストだけが変更できます。");
-      playSound("error");
-      return;
-    }
-
-    setBgmTrackId(nextTrackId);
-
-    const nextEnabled = nextTrackId !== "none" ? bgmEnabled : false;
-
-    if (nextTrackId === "none") {
-      setBgmEnabled(false);
-    }
-
-    syncGameState({
-      bgmTrackId: nextTrackId,
-      bgmEnabled: nextEnabled,
-      message: nextTrackId === "none" ? "BGMを停止しました。" : `BGMを「${BGM_TRACKS.find((item) => item.id === nextTrackId)?.label ?? "BGM"}」に設定しました。`,
-    });
   }
 
   function toggleServerBgm() {
@@ -320,25 +317,22 @@ function App() {
       return;
     }
 
-    if (bgmTrackId === "none") {
-      setMessage("先にBGMを選んでください。");
-      playSound("error");
-      return;
-    }
-
     const nextEnabled = !bgmEnabled;
+    const nextTrackId = nextEnabled ? getEffectiveBgmTrackId() || "main" : "none";
+
     setBgmEnabled(nextEnabled);
-    applyBgmPlayback(nextEnabled, bgmTrackId);
+    setBgmTrackId(nextTrackId);
+    applyBgmPlayback(nextEnabled, nextTrackId);
 
     syncGameState({
-      bgmTrackId,
+      bgmTrackId: nextTrackId,
       bgmEnabled: nextEnabled,
-      message: nextEnabled ? "BGMを再生しました。" : "BGMを停止しました。",
+      message: nextEnabled ? "BGM同期をONにしました。" : "BGM同期をOFFにしました。",
     });
   }
 
   function replayBgmLocally() {
-    applyBgmPlayback(bgmEnabled, bgmTrackId);
+    applyBgmPlayback(bgmEnabled, getEffectiveBgmTrackId());
   }
 
   useEffect(() => {
@@ -379,12 +373,14 @@ function App() {
       setWhiteTeam(state.whiteTeam);
       setMoveHistory(state.moveHistory);
       setBoardHistory(state.boardHistory ?? [createInitialBoard()]);
-      setReviewIndex(null);
+      setReviewIndex(state.reviewIndex ?? null);
       setMessage(state.message);
       setHostId(state.hostId ?? null);
       setTurnsPerPlayer(state.turnsPerPlayer ?? DEFAULT_TURNS_PER_PLAYER);
+      setActiveTurnSide(state.activeTurnSide ?? null);
+      setActiveTurnPlayerId(state.activeTurnPlayerId ?? null);
       setBgmTrackId(state.bgmTrackId ?? "none");
-      setBgmEnabled(state.bgmEnabled ?? false);
+      setBgmEnabled(state.bgmEnabled ?? true);
       setLastSyncedAt(formatNow());
       setSelectedSquare(null);
       setSelectedHandPiece(null);
@@ -440,8 +436,10 @@ function App() {
   }, [timerNow, gameStatus, soundEnabled, timerSoundEnabled, turnStartedAt]);
 
   useEffect(() => {
-    applyBgmPlayback(bgmEnabled, bgmTrackId);
-  }, [bgmTrackId, bgmEnabled]);
+    const effectiveTrackId = getEffectiveBgmTrackId();
+    setBgmTrackId(effectiveTrackId);
+    applyBgmPlayback(bgmEnabled, effectiveTrackId);
+  }, [bgmEnabled, gameStatus, moveCount, reviewIndex]);
 
   useEffect(() => {
     if (bgmAudioRef.current) {
@@ -473,6 +471,9 @@ function App() {
       turnsPerPlayer,
       bgmTrackId,
       bgmEnabled,
+      reviewIndex,
+      activeTurnSide,
+      activeTurnPlayerId,
       ...next,
     };
 
@@ -754,7 +755,18 @@ function App() {
     return `あなたは観戦者です${hostText}`;
   }
 
-  function getTurnInfo(currentMoveCount: number): TurnInfo | null {
+  function findParticipantById(userId: string | null) {
+    if (!userId) return null;
+
+    return (
+      blackTeam.find((p) => p.id === userId) ??
+      whiteTeam.find((p) => p.id === userId) ??
+      participants.find((p) => p.id === userId) ??
+      (currentUser?.id === userId ? currentUser : null)
+    );
+  }
+
+  function calculateTurnInfo(currentMoveCount: number): TurnInfo | null {
     if (blackTeam.length === 0 || whiteTeam.length === 0) return null;
 
     const side: TeamSide = currentMoveCount % 2 === 0 ? "black" : "white";
@@ -764,6 +776,36 @@ function App() {
     const repeatIndex = sideTurnNumber % turnsPerPlayer;
 
     return { moveNumber: currentMoveCount + 1, side, player: team[playerIndex], playerIndex, repeatIndex };
+  }
+
+  function getTurnInfo(currentMoveCount: number): TurnInfo | null {
+    if (currentMoveCount === moveCount && activeTurnSide && activeTurnPlayerId) {
+      const lockedPlayer = findParticipantById(activeTurnPlayerId);
+
+      if (lockedPlayer) {
+        const team = activeTurnSide === "black" ? blackTeam : whiteTeam;
+        const playerIndex = Math.max(0, team.findIndex((p) => p.id === activeTurnPlayerId));
+
+        return {
+          moveNumber: currentMoveCount + 1,
+          side: activeTurnSide,
+          player: lockedPlayer,
+          playerIndex,
+          repeatIndex: 0,
+        };
+      }
+    }
+
+    return calculateTurnInfo(currentMoveCount);
+  }
+
+  function getNextActiveTurn(nextMoveCount: number) {
+    const nextTurn = calculateTurnInfo(nextMoveCount);
+
+    return {
+      nextActiveTurnSide: nextTurn?.side ?? null,
+      nextActiveTurnPlayerId: nextTurn?.player.id ?? null,
+    };
   }
 
   function canOperateNow(side: TeamSide) {
@@ -776,6 +818,7 @@ function App() {
 
     return currentTurn.side === side && currentTurn.player.id === user.id;
   }
+
 
   function cloneBoard(sourceBoard: Board) {
     return sourceBoard.map((row) => row.map((piece) => (piece ? { ...piece } : null)));
@@ -805,6 +848,12 @@ function App() {
 
     if (gameStatus === "finished") {
       setMessage("対局終了後は、ロビーに戻ってからチーム変更してください。");
+      playSound("error");
+      return;
+    }
+
+    if (gameStatus === "playing" && activeTurnPlayerId === participant.id && activeTurnSide !== side) {
+      setMessage("現在手番の人は、手番が終わるまで別チームへ移動できません。手番スキップか着手後に変更してください。");
       playSound("error");
       return;
     }
@@ -840,6 +889,12 @@ function App() {
 
     if (gameStatus === "finished") {
       setMessage("対局終了後は、ロビーに戻ってからチーム変更してください。");
+      playSound("error");
+      return;
+    }
+
+    if (gameStatus === "playing" && activeTurnPlayerId === participant.id) {
+      setMessage("現在手番の人は、手番が終わるまでチームから外せません。手番スキップか着手後に変更してください。");
       playSound("error");
       return;
     }
@@ -1015,10 +1070,31 @@ function App() {
     setReviewIndex(null);
     setMessage("対局を開始しました。");
     setPendingPromotion(null);
+    setBgmEnabled(true);
+    const firstTurn = calculateTurnInfo(0);
+    const firstActiveTurnSide = firstTurn?.side ?? null;
+    const firstActiveTurnPlayerId = firstTurn?.player.id ?? null;
+
+    setBgmTrackId("main");
+    setActiveTurnSide(firstActiveTurnSide);
+    setActiveTurnPlayerId(firstActiveTurnPlayerId);
     setGameStatus("playing");
     playSound("move");
 
-    syncGameState({ gameStatus: "playing", moveCount: 0, board: newBoard, hands: newHands, moveHistory: newMoveHistory, boardHistory: [newBoard], message: "対局を開始しました。" });
+    syncGameState({
+      gameStatus: "playing",
+      moveCount: 0,
+      board: newBoard,
+      hands: newHands,
+      moveHistory: newMoveHistory,
+      boardHistory: [newBoard],
+      bgmEnabled: true,
+      bgmTrackId: "main",
+      reviewIndex: null,
+      activeTurnSide: firstActiveTurnSide,
+      activeTurnPlayerId: firstActiveTurnPlayerId,
+      message: "対局を開始しました。",
+    });
   }
 
   function rematchGame() {
@@ -1050,6 +1126,14 @@ function App() {
     setPendingPromotion(null);
     setPendingConfirm(null);
     setPendingResignSide(null);
+    setBgmEnabled(true);
+    const firstTurn = calculateTurnInfo(0);
+    const firstActiveTurnSide = firstTurn?.side ?? null;
+    const firstActiveTurnPlayerId = firstTurn?.player.id ?? null;
+
+    setBgmTrackId("main");
+    setActiveTurnSide(firstActiveTurnSide);
+    setActiveTurnPlayerId(firstActiveTurnPlayerId);
     setGameStatus("playing");
     playSound("move");
 
@@ -1060,6 +1144,11 @@ function App() {
       hands: newHands,
       moveHistory: newMoveHistory,
       boardHistory: [newBoard],
+      bgmEnabled: true,
+      bgmTrackId: "main",
+      reviewIndex: null,
+      activeTurnSide: firstActiveTurnSide,
+      activeTurnPlayerId: firstActiveTurnPlayerId,
       message: "同じチームで再戦を開始しました。",
     });
   }
@@ -1088,6 +1177,8 @@ function App() {
     setPendingPromotion(null);
     setPendingConfirm(null);
     setPendingResignSide(null);
+    setActiveTurnSide(null);
+    setActiveTurnPlayerId(null);
     setGameStatus("lobby");
     playSound("finish");
 
@@ -1098,6 +1189,9 @@ function App() {
       hands: newHands,
       moveHistory: newMoveHistory,
       boardHistory: [newBoard],
+      reviewIndex: null,
+      activeTurnSide: null,
+      activeTurnPlayerId: null,
       message: "ロビーに戻りました。必要ならチームを組み直してください。",
     });
   }
@@ -1157,10 +1251,14 @@ function App() {
     setPendingPromotion(null);
     setPendingConfirm(null);
     setPendingResignSide(null);
+    setActiveTurnSide(null);
+    setActiveTurnPlayerId(null);
     playSound("finish");
 
     syncGameState({
       gameStatus: "finished",
+      activeTurnSide: null,
+      activeTurnPlayerId: null,
       message: resignMessage,
     });
   }
@@ -1213,11 +1311,14 @@ function App() {
     ];
 
     const newBoardHistory = [...boardHistory, cloneBoard(board)];
+    const { nextActiveTurnSide, nextActiveTurnPlayerId } = getNextActiveTurn(newMoveCount);
 
     setMoveCount(newMoveCount);
     setMoveHistory(newMoveHistory);
     setBoardHistory(newBoardHistory);
     setReviewIndex(null);
+    setActiveTurnSide(nextActiveTurnSide);
+    setActiveTurnPlayerId(nextActiveTurnPlayerId);
     setSelectedSquare(null);
     setSelectedHandPiece(null);
     setPendingPromotion(null);
@@ -1230,6 +1331,9 @@ function App() {
       moveCount: newMoveCount,
       moveHistory: newMoveHistory,
       boardHistory: newBoardHistory,
+      reviewIndex: null,
+      activeTurnSide: nextActiveTurnSide,
+      activeTurnPlayerId: nextActiveTurnPlayerId,
       message: skipMessage,
     });
   }
@@ -1492,6 +1596,7 @@ function App() {
     ];
     const newMoveCount = moveCount + 1;
     const newBoardHistory = [...boardHistory, cloneBoard(newBoard)];
+    const { nextActiveTurnSide, nextActiveTurnPlayerId } = getNextActiveTurn(newMoveCount);
 
     setBoard(newBoard);
     setHands(newHands);
@@ -1499,6 +1604,8 @@ function App() {
     setBoardHistory(newBoardHistory);
     setReviewIndex(null);
     setMoveCount(newMoveCount);
+    setActiveTurnSide(finish.nextGameStatus === "playing" ? nextActiveTurnSide : null);
+    setActiveTurnPlayerId(finish.nextGameStatus === "playing" ? nextActiveTurnPlayerId : null);
     setSelectedSquare(null);
     setSelectedHandPiece(null);
     setPendingPromotion(null);
@@ -1506,7 +1613,18 @@ function App() {
     setGameStatus(finish.nextGameStatus);
     playSound(finish.sound);
 
-    syncGameState({ board: newBoard, hands: newHands, moveHistory: newMoveHistory, boardHistory: newBoardHistory, moveCount: newMoveCount, message: finish.nextMessage, gameStatus: finish.nextGameStatus });
+    syncGameState({
+      board: newBoard,
+      hands: newHands,
+      moveHistory: newMoveHistory,
+      boardHistory: newBoardHistory,
+      reviewIndex: null,
+      moveCount: newMoveCount,
+      activeTurnSide: finish.nextGameStatus === "playing" ? nextActiveTurnSide : null,
+      activeTurnPlayerId: finish.nextGameStatus === "playing" ? nextActiveTurnPlayerId : null,
+      message: finish.nextMessage,
+      gameStatus: finish.nextGameStatus,
+    });
   }
 
   function completeMove(promote: boolean) {
@@ -1609,6 +1727,7 @@ function App() {
     ];
     const newMoveCount = moveCount + 1;
     const newBoardHistory = [...boardHistory, cloneBoard(newBoard)];
+    const { nextActiveTurnSide, nextActiveTurnPlayerId } = getNextActiveTurn(newMoveCount);
 
     setBoard(newBoard);
     setHands(newHands);
@@ -1616,13 +1735,26 @@ function App() {
     setBoardHistory(newBoardHistory);
     setReviewIndex(null);
     setMoveCount(newMoveCount);
+    setActiveTurnSide(finish.nextGameStatus === "playing" ? nextActiveTurnSide : null);
+    setActiveTurnPlayerId(finish.nextGameStatus === "playing" ? nextActiveTurnPlayerId : null);
     setSelectedSquare(null);
     setSelectedHandPiece(null);
     setMessage(finish.nextMessage);
     setGameStatus(finish.nextGameStatus);
     playSound(finish.sound);
 
-    syncGameState({ board: newBoard, hands: newHands, moveHistory: newMoveHistory, boardHistory: newBoardHistory, moveCount: newMoveCount, message: finish.nextMessage, gameStatus: finish.nextGameStatus });
+    syncGameState({
+      board: newBoard,
+      hands: newHands,
+      moveHistory: newMoveHistory,
+      boardHistory: newBoardHistory,
+      reviewIndex: null,
+      moveCount: newMoveCount,
+      activeTurnSide: finish.nextGameStatus === "playing" ? nextActiveTurnSide : null,
+      activeTurnPlayerId: finish.nextGameStatus === "playing" ? nextActiveTurnPlayerId : null,
+      message: finish.nextMessage,
+      gameStatus: finish.nextGameStatus,
+    });
   }
 
   function handleSquareClick(row: number, col: number) {
@@ -1660,6 +1792,22 @@ function App() {
       setMessage("選択を解除しました。");
       return;
     }
+
+    const selectedPiece = board[selectedSquare.row][selectedSquare.col];
+
+    if (clickedPiece && selectedPiece && clickedPiece.side === selectedPiece.side) {
+      if (!canOperateNow(clickedPiece.side)) {
+        setMessage("現在指す人だけが駒を選択できます。");
+        playSound("error");
+        return;
+      }
+
+      setSelectedSquare({ row, col });
+      setSelectedHandPiece(null);
+      setMessage(`${clickedPiece.name}を選択しました。`);
+      return;
+    }
+
     movePiece(selectedSquare, { row, col });
   }
 
@@ -1740,6 +1888,12 @@ function App() {
     }
 
     return lastMove.to.row === row && lastMove.to.col === col;
+  }
+
+  function getDisplayPosition(row: number, col: number) {
+    const displayRow = viewerBottomSide === "black" ? row : 8 - row;
+    const displayCol = viewerBottomSide === "black" ? col : 8 - col;
+    return { displayRow, displayCol };
   }
 
   function getTurnRemainingSeconds() {
@@ -1907,11 +2061,11 @@ function App() {
 
   function getOperationGuideText() {
     if (gameStatus === "lobby") {
-      return "ロビーです。チーム分けをしてゲームを開始してください。";
+      return "ロビーです。";
     }
 
     if (gameStatus === "finished") {
-      return "対局は終了しています。同じチームで再戦するか、ロビーに戻れます。";
+      return "対局は終了しています。";
     }
 
     if (testFreeMoveMode) {
@@ -1929,11 +2083,11 @@ function App() {
     const mySide = getCurrentUserSide();
 
     if (mySide === "spectator") {
-      return "あなたは観戦者です。盤面を見ることはできますが、駒は動かせません。";
+      return "あなたは観戦者です。";
     }
 
     if (currentTurn.player.id === currentUser.id) {
-      return "あなたの手番です。駒を選んで指してください。";
+      return "あなたの手番です。";
     }
 
     if (currentTurn.side === mySide) {
@@ -2069,11 +2223,13 @@ function App() {
     function setSafeReviewIndex(nextIndex: number | null) {
       if (nextIndex === null) {
         setReviewIndex(null);
+        syncGameState({ reviewIndex: null, message: "最新局面に戻りました。" });
         return;
       }
 
       const safeIndex = Math.min(Math.max(nextIndex, 0), boardHistory.length - 1);
       setReviewIndex(safeIndex);
+      syncGameState({ reviewIndex: safeIndex, message: `${safeIndex}手目を感想戦表示中です。` });
     }
 
     return (
@@ -2240,56 +2396,36 @@ function App() {
           border: "1px solid #444",
         }}
       >
-        <strong>BGM・通話メモ</strong>
+        <strong>BGM</strong>
         <div style={{ marginTop: 8, display: "flex", justifyContent: "center", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-            BGM
-            <select
-              value={bgmTrackId}
-              onChange={(event) => changeBgmTrack(event.target.value as BgmTrackId)}
-              disabled={!isCurrentUserHost()}
-            >
-              {BGM_TRACKS.map((track) => (
-                <option key={track.id} value={track.id}>{track.label}</option>
-              ))}
-            </select>
-          </label>
+          <span>現在: {getSelectedBgmTrack().label}</span>
 
-          <button onClick={toggleServerBgm} disabled={!isCurrentUserHost() || bgmTrackId === "none"}>
-            {bgmEnabled ? "BGM停止" : "BGM再生"}
+          <button onClick={toggleServerBgm} disabled={!isCurrentUserHost()}>
+            {bgmEnabled ? "BGM同期OFF" : "BGM同期ON"}
           </button>
 
           <button onClick={replayBgmLocally}>自分だけBGM再開</button>
 
           <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-            音量
+            自分の音量
             <input
               type="range"
               min="0"
-              max="1"
-              step="0.05"
+              max="0.5"
+              step="0.01"
               value={bgmVolume}
               onChange={(event) => setBgmVolume(Number(event.target.value))}
             />
           </label>
-
-          <button onClick={() => setTeamMuteNoticeEnabled((value) => !value)}>
-            {teamMuteNoticeEnabled ? "味方ミュート案内ON" : "味方ミュート案内OFF"}
-          </button>
         </div>
 
         <p style={{ margin: "8px 0 0", color: "#bbb", fontSize: 13 }}>
-          BGMファイルは <code>public/bgm/main.mp3</code> と <code>public/bgm/calm.mp3</code> に置くと全員が同じBGMを選べます。
-          ブラウザの仕様で自動再生が止まった場合は「自分だけBGM再開」を押してください。
+          BGMは全員に同期されます。各端末が同じ音源を再生し、音量だけ各自で調整します。
+          <code>public/bgm/main.mp3</code>、<code>public/bgm/calm.mp3</code>、<code>public/bgm/review.mp3</code> を置いてください。
+          50手目から終盤戦BGM、感想戦・対局終了時は感想戦BGMへ自動で切り替わります。
         </p>
 
-        {teamMuteNoticeEnabled && gameStatus === "playing" && currentTurn && getCurrentUserSide() === currentTurn.side && (
-          <p style={{ margin: "8px 0 0", color: "#ffd166", fontWeight: "bold" }}>
-            味方チームの手番です。相談禁止で遊ぶ場合は、味方はDiscord側でミュートしてください。
-          </p>
-        )}
-
-        {getSelectedBgmTrack().url && <audio ref={bgmAudioRef} src={getSelectedBgmTrack().url} loop />}
+        {getSelectedBgmTrack().url && <audio ref={bgmAudioRef} src={getSelectedBgmTrack().url} loop preload="auto" />}
       </section>
 
       <section
@@ -2748,12 +2884,6 @@ function App() {
 
               {message && <p style={{ color: "#ffd166", fontWeight: "bold" }}>{message}</p>}
 
-              {pendingPromotion && (
-                <div style={{ margin: "12px 0" }}>
-                  <button onClick={() => completeMove(true)} style={{ marginRight: 8, padding: "8px 14px" }}>成る</button>
-                  <button onClick={() => completeMove(false)} style={{ padding: "8px 14px" }}>成らない</button>
-                </div>
-              )}
 
               <p style={{ marginTop: 12 }}>
                 盤面表示: {viewerBottomSide === "black" ? "先手を下に表示" : "後手を下に表示"}
@@ -2779,6 +2909,7 @@ function App() {
                   <BoardTurnHeader />
                   <div
                     style={{
+                      position: "relative",
                       display: "grid",
                       gridTemplateColumns: "repeat(9, 44px)",
                       gridTemplateRows: "repeat(9, 44px)",
@@ -2818,6 +2949,33 @@ function App() {
                         </button>
                       );
                     })}
+
+                    {pendingPromotion && (() => {
+                      const { displayRow, displayCol } = getDisplayPosition(pendingPromotion.to.row, pendingPromotion.to.col);
+                      const left = Math.min(displayCol * 44 + 42, 300);
+                      const top = Math.max(displayRow * 44 - 4, 4);
+
+                      return (
+                        <div
+                          style={{
+                            position: "absolute",
+                            left,
+                            top,
+                            zIndex: 5,
+                            display: "flex",
+                            gap: 4,
+                            padding: 4,
+                            borderRadius: 8,
+                            background: "rgba(30, 31, 34, 0.92)",
+                            border: "1px solid #ffd166",
+                            boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
+                          }}
+                        >
+                          <button onClick={() => completeMove(true)} style={{ padding: "4px 8px", fontWeight: "bold" }}>成る</button>
+                          <button onClick={() => completeMove(false)} style={{ padding: "4px 8px" }}>成らない</button>
+                        </div>
+                      );
+                    })()}
                   </div>
                 </section>
 
@@ -2827,7 +2985,7 @@ function App() {
                 </section>
               </div>
 
-              <p style={{ marginTop: 12 }}>友達間で遊ぶ用の一旦完成版です。観戦者は操作不可、現在指す人だけが操作できます。</p>
+              <p style={{ marginTop: 12 }}>観戦者は操作不可、現在指す人だけが操作できます。</p>
 
               <h3 style={{ marginTop: 24 }}>棋譜ログ</h3>
               {moveHistory.length === 0 ? <p>まだ指し手はありません。</p> : (
