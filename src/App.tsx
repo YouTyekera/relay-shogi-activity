@@ -14,7 +14,7 @@ type BgmTrackId = "none" | "main" | "calm";
 const BGM_TRACKS: { id: BgmTrackId; label: string; url: string }[] = [
   { id: "none", label: "なし", url: "" },
   { id: "main", label: "通常BGM", url: "/bgm/main.mp3" },
-  { id: "calm", label: "終盤BGM", url: "/bgm/calm.mp3" },
+  { id: "calm", label: "BGM", url: "/bgm/calm.mp3" },
 ];
 
 type Participant = {
@@ -775,20 +775,6 @@ function App() {
     if (!user || !currentTurn || gameStatus !== "playing") return false;
 
     return currentTurn.side === side && currentTurn.player.id === user.id;
-  }
-
-  function canResignNow() {
-    if (gameStatus !== "playing") return false;
-    if (testFreeMoveMode) return true;
-
-    const side = getCurrentUserSide();
-    return side === "black" || side === "white";
-  }
-
-  function canReturnLobbyNow() {
-    // 友達間プレイでは「変な状態になったときに戻せる」ことを優先する。
-    // そのため、対局中・対局終了後は誰でもロビーへ戻れるようにする。
-    return gameStatus !== "lobby";
   }
 
   function cloneBoard(sourceBoard: Board) {
