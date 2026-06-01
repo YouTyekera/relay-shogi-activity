@@ -9,6 +9,14 @@ const discordSdk = isDiscordActivity ? new DiscordSDK(CLIENT_ID) : null;
 const DEFAULT_TURNS_PER_PLAYER = 1;
 const SOCKET_URL = "";
 
+type BgmTrackId = "none" | "main" | "calm";
+
+const BGM_TRACKS: { id: BgmTrackId; label: string; url: string }[] = [
+  { id: "none", label: "なし", url: "" },
+  { id: "main", label: "通常BGM", url: "/bgm/main.mp3" },
+  { id: "calm", label: "終盤BGM", url: "/bgm/calm.mp3" },
+];
+
 type Participant = {
   id: string;
   username?: string;
@@ -59,9 +67,12 @@ type SyncState = {
   blackTeam: Participant[];
   whiteTeam: Participant[];
   moveHistory: MoveRecord[];
+  boardHistory: Board[];
   message: string;
   hostId: string | null;
   turnsPerPlayer: number;
+  bgmTrackId?: BgmTrackId;
+  bgmEnabled?: boolean;
 };
 
 function createInitialBoard(): Board {
@@ -90,6 +101,10 @@ function App() {
   const socketRef = useRef<Socket | null>(null);
   const roomIdRef = useRef("local-room");
   const audioContextRef = useRef<AudioContext | null>(null);
+  const bgmAudioRef = useRef<HTMLAudioElement | null>(null);
+  const urgentOscRef = useRef<OscillatorNode | null>(null);
+  const urgentGainRef = useRef<GainNode | null>(null);
+  const lastTimerBeepSecondRef = useRef<number | null>(null);
 
   const [status, setStatus] = useState("起動中...");
   const [socketStatus, setSocketStatus] = useState("Socket未接続");
@@ -107,6 +122,8 @@ function App() {
   const [selectedSquare, setSelectedSquare] = useState<SquarePos | null>(null);
   const [selectedHandPiece, setSelectedHandPiece] = useState<SelectedHandPiece | null>(null);
   const [moveHistory, setMoveHistory] = useState<MoveRecord[]>([]);
+  const [boardHistory, setBoardHistory] = useState<Board[]>([createInitialBoard()]);
+  const [reviewIndex, setReviewIndex] = useState<number | null>(null);
   const [message, setMessage] = useState("");
   const [testFreeMoveMode, setTestFreeMoveMode] = useState(false);
   const [pendingPromotion, setPendingPromotion] = useState<PendingPromotion | null>(null);
@@ -122,6 +139,11 @@ function App() {
   const [turnsPerPlayer, setTurnsPerPlayer] = useState(DEFAULT_TURNS_PER_PLAYER);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
   const [showHelpPanel, setShowHelpPanel] = useState(false);
+  const [timerSoundEnabled, setTimerSoundEnabled] = useState(true);
+  const [bgmTrackId, setBgmTrackId] = useState<BgmTrackId>("none");
+  const [bgmEnabled, setBgmEnabled] = useState(false);
+  const [bgmVolume, setBgmVolume] = useState(0.35);
+  const [teamMuteNoticeEnabled, setTeamMuteNoticeEnabled] = useState(false);
 
   function formatNow() {
     return new Date().toLocaleTimeString("ja-JP", {
@@ -171,6 +193,154 @@ function App() {
     }
   }
 
+
+  function getAudioContext() {
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContextClass();
+    }
+
+    return audioContextRef.current;
+  }
+
+  function playTimerBeep() {
+    if (!soundEnabled || !timerSoundEnabled) return;
+
+    try {
+      const ctx = getAudioContext();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.type = "square";
+      osc.frequency.value = 980;
+      gain.gain.setValueAtTime(0.045, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.08);
+    } catch {
+      // タイマー音に失敗してもゲームは止めない
+    }
+  }
+
+  function startUrgentTimerTone() {
+    if (!soundEnabled || !timerSoundEnabled) return;
+    if (urgentOscRef.current) return;
+
+    try {
+      const ctx = getAudioContext();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.type = "sine";
+      osc.frequency.value = 740;
+      gain.gain.setValueAtTime(0.025, ctx.currentTime);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+
+      urgentOscRef.current = osc;
+      urgentGainRef.current = gain;
+    } catch {
+      urgentOscRef.current = null;
+      urgentGainRef.current = null;
+    }
+  }
+
+  function stopUrgentTimerTone() {
+    try {
+      if (urgentGainRef.current && audioContextRef.current) {
+        urgentGainRef.current.gain.setValueAtTime(0.001, audioContextRef.current.currentTime);
+      }
+
+      if (urgentOscRef.current) {
+        urgentOscRef.current.stop();
+      }
+    } catch {
+      // 既に停止済みの場合は何もしない
+    }
+
+    urgentOscRef.current = null;
+    urgentGainRef.current = null;
+  }
+
+  function getSelectedBgmTrack() {
+    return BGM_TRACKS.find((track) => track.id === bgmTrackId) ?? BGM_TRACKS[0];
+  }
+
+  async function applyBgmPlayback(nextEnabled: boolean, nextTrackId: BgmTrackId) {
+    const audio = bgmAudioRef.current;
+    const track = BGM_TRACKS.find((item) => item.id === nextTrackId) ?? BGM_TRACKS[0];
+
+    if (!audio) return;
+
+    audio.volume = bgmVolume;
+
+    if (!nextEnabled || track.id === "none") {
+      audio.pause();
+      audio.currentTime = 0;
+      return;
+    }
+
+    try {
+      await audio.play();
+    } catch {
+      setMessage("BGMの自動再生がブロックされました。BGM再生ボタンをもう一度押してください。");
+    }
+  }
+
+  function changeBgmTrack(nextTrackId: BgmTrackId) {
+    if (!isCurrentUserHost()) {
+      setMessage("BGM設定はホストだけが変更できます。");
+      playSound("error");
+      return;
+    }
+
+    setBgmTrackId(nextTrackId);
+
+    const nextEnabled = nextTrackId !== "none" ? bgmEnabled : false;
+
+    if (nextTrackId === "none") {
+      setBgmEnabled(false);
+    }
+
+    syncGameState({
+      bgmTrackId: nextTrackId,
+      bgmEnabled: nextEnabled,
+      message: nextTrackId === "none" ? "BGMを停止しました。" : `BGMを「${BGM_TRACKS.find((item) => item.id === nextTrackId)?.label ?? "BGM"}」に設定しました。`,
+    });
+  }
+
+  function toggleServerBgm() {
+    if (!isCurrentUserHost()) {
+      setMessage("BGMの再生/停止はホストだけが操作できます。");
+      playSound("error");
+      return;
+    }
+
+    if (bgmTrackId === "none") {
+      setMessage("先にBGMを選んでください。");
+      playSound("error");
+      return;
+    }
+
+    const nextEnabled = !bgmEnabled;
+    setBgmEnabled(nextEnabled);
+    applyBgmPlayback(nextEnabled, bgmTrackId);
+
+    syncGameState({
+      bgmTrackId,
+      bgmEnabled: nextEnabled,
+      message: nextEnabled ? "BGMを再生しました。" : "BGMを停止しました。",
+    });
+  }
+
+  function replayBgmLocally() {
+    applyBgmPlayback(bgmEnabled, bgmTrackId);
+  }
+
   useEffect(() => {
     const socket = io(SOCKET_URL, {
       path: "/socket.io",
@@ -208,9 +378,13 @@ function App() {
       setBlackTeam(state.blackTeam);
       setWhiteTeam(state.whiteTeam);
       setMoveHistory(state.moveHistory);
+      setBoardHistory(state.boardHistory ?? [createInitialBoard()]);
+      setReviewIndex(null);
       setMessage(state.message);
       setHostId(state.hostId ?? null);
       setTurnsPerPlayer(state.turnsPerPlayer ?? DEFAULT_TURNS_PER_PLAYER);
+      setBgmTrackId(state.bgmTrackId ?? "none");
+      setBgmEnabled(state.bgmEnabled ?? false);
       setLastSyncedAt(formatNow());
       setSelectedSquare(null);
       setSelectedHandPiece(null);
@@ -240,6 +414,50 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const remainingSeconds = getTurnRemainingSeconds();
+
+    if (gameStatus !== "playing" || !soundEnabled || !timerSoundEnabled) {
+      stopUrgentTimerTone();
+      lastTimerBeepSecondRef.current = null;
+      return;
+    }
+
+    if (remainingSeconds <= 5 && remainingSeconds > 0) {
+      startUrgentTimerTone();
+    } else {
+      stopUrgentTimerTone();
+    }
+
+    if ([20, 10, 6].includes(remainingSeconds) && lastTimerBeepSecondRef.current !== remainingSeconds) {
+      playTimerBeep();
+      lastTimerBeepSecondRef.current = remainingSeconds;
+    }
+
+    if (remainingSeconds === 0) {
+      stopUrgentTimerTone();
+    }
+  }, [timerNow, gameStatus, soundEnabled, timerSoundEnabled, turnStartedAt]);
+
+  useEffect(() => {
+    applyBgmPlayback(bgmEnabled, bgmTrackId);
+  }, [bgmTrackId, bgmEnabled]);
+
+  useEffect(() => {
+    if (bgmAudioRef.current) {
+      bgmAudioRef.current.volume = bgmVolume;
+    }
+  }, [bgmVolume]);
+
+  useEffect(() => {
+    return () => {
+      stopUrgentTimerTone();
+      if (bgmAudioRef.current) {
+        bgmAudioRef.current.pause();
+      }
+    };
+  }, []);
+
   function syncGameState(next: Partial<SyncState>) {
     const state: SyncState = {
       gameStatus,
@@ -249,9 +467,12 @@ function App() {
       blackTeam,
       whiteTeam,
       moveHistory,
+      boardHistory,
       message,
       hostId,
       turnsPerPlayer,
+      bgmTrackId,
+      bgmEnabled,
       ...next,
     };
 
@@ -556,6 +777,20 @@ function App() {
     return currentTurn.side === side && currentTurn.player.id === user.id;
   }
 
+  function canResignNow() {
+    if (gameStatus !== "playing") return false;
+    if (testFreeMoveMode) return true;
+
+    const side = getCurrentUserSide();
+    return side === "black" || side === "white";
+  }
+
+  function canReturnLobbyNow() {
+    // 友達間プレイでは「変な状態になったときに戻せる」ことを優先する。
+    // そのため、対局中・対局終了後は誰でもロビーへ戻れるようにする。
+    return gameStatus !== "lobby";
+  }
+
   function cloneBoard(sourceBoard: Board) {
     return sourceBoard.map((row) => row.map((piece) => (piece ? { ...piece } : null)));
   }
@@ -790,12 +1025,14 @@ function App() {
     setSelectedSquare(null);
     setSelectedHandPiece(null);
     setMoveHistory(newMoveHistory);
+    setBoardHistory([newBoard]);
+    setReviewIndex(null);
     setMessage("対局を開始しました。");
     setPendingPromotion(null);
     setGameStatus("playing");
     playSound("move");
 
-    syncGameState({ gameStatus: "playing", moveCount: 0, board: newBoard, hands: newHands, moveHistory: newMoveHistory, message: "対局を開始しました。" });
+    syncGameState({ gameStatus: "playing", moveCount: 0, board: newBoard, hands: newHands, moveHistory: newMoveHistory, boardHistory: [newBoard], message: "対局を開始しました。" });
   }
 
   function rematchGame() {
@@ -821,6 +1058,8 @@ function App() {
     setSelectedSquare(null);
     setSelectedHandPiece(null);
     setMoveHistory(newMoveHistory);
+    setBoardHistory([newBoard]);
+    setReviewIndex(null);
     setMessage("同じチームで再戦を開始しました。");
     setPendingPromotion(null);
     setPendingConfirm(null);
@@ -834,6 +1073,7 @@ function App() {
       board: newBoard,
       hands: newHands,
       moveHistory: newMoveHistory,
+      boardHistory: [newBoard],
       message: "同じチームで再戦を開始しました。",
     });
   }
@@ -856,6 +1096,8 @@ function App() {
     setSelectedSquare(null);
     setSelectedHandPiece(null);
     setMoveHistory(newMoveHistory);
+    setBoardHistory([newBoard]);
+    setReviewIndex(null);
     setMessage("ロビーに戻りました。必要ならチームを組み直してください。");
     setPendingPromotion(null);
     setPendingConfirm(null);
@@ -869,6 +1111,7 @@ function App() {
       board: newBoard,
       hands: newHands,
       moveHistory: newMoveHistory,
+      boardHistory: [newBoard],
       message: "ロビーに戻りました。必要ならチームを組み直してください。",
     });
   }
@@ -983,8 +1226,12 @@ function App() {
       ...moveHistory,
     ];
 
+    const newBoardHistory = [...boardHistory, cloneBoard(board)];
+
     setMoveCount(newMoveCount);
     setMoveHistory(newMoveHistory);
+    setBoardHistory(newBoardHistory);
+    setReviewIndex(null);
     setSelectedSquare(null);
     setSelectedHandPiece(null);
     setPendingPromotion(null);
@@ -996,6 +1243,7 @@ function App() {
     syncGameState({
       moveCount: newMoveCount,
       moveHistory: newMoveHistory,
+      boardHistory: newBoardHistory,
       message: skipMessage,
     });
   }
@@ -1257,10 +1505,13 @@ function App() {
       ...moveHistory,
     ];
     const newMoveCount = moveCount + 1;
+    const newBoardHistory = [...boardHistory, cloneBoard(newBoard)];
 
     setBoard(newBoard);
     setHands(newHands);
     setMoveHistory(newMoveHistory);
+    setBoardHistory(newBoardHistory);
+    setReviewIndex(null);
     setMoveCount(newMoveCount);
     setSelectedSquare(null);
     setSelectedHandPiece(null);
@@ -1269,7 +1520,7 @@ function App() {
     setGameStatus(finish.nextGameStatus);
     playSound(finish.sound);
 
-    syncGameState({ board: newBoard, hands: newHands, moveHistory: newMoveHistory, moveCount: newMoveCount, message: finish.nextMessage, gameStatus: finish.nextGameStatus });
+    syncGameState({ board: newBoard, hands: newHands, moveHistory: newMoveHistory, boardHistory: newBoardHistory, moveCount: newMoveCount, message: finish.nextMessage, gameStatus: finish.nextGameStatus });
   }
 
   function completeMove(promote: boolean) {
@@ -1371,10 +1622,13 @@ function App() {
       ...moveHistory,
     ];
     const newMoveCount = moveCount + 1;
+    const newBoardHistory = [...boardHistory, cloneBoard(newBoard)];
 
     setBoard(newBoard);
     setHands(newHands);
     setMoveHistory(newMoveHistory);
+    setBoardHistory(newBoardHistory);
+    setReviewIndex(null);
     setMoveCount(newMoveCount);
     setSelectedSquare(null);
     setSelectedHandPiece(null);
@@ -1382,10 +1636,15 @@ function App() {
     setGameStatus(finish.nextGameStatus);
     playSound(finish.sound);
 
-    syncGameState({ board: newBoard, hands: newHands, moveHistory: newMoveHistory, moveCount: newMoveCount, message: finish.nextMessage, gameStatus: finish.nextGameStatus });
+    syncGameState({ board: newBoard, hands: newHands, moveHistory: newMoveHistory, boardHistory: newBoardHistory, moveCount: newMoveCount, message: finish.nextMessage, gameStatus: finish.nextGameStatus });
   }
 
   function handleSquareClick(row: number, col: number) {
+    if (reviewIndex !== null) {
+      setMessage("感想戦表示中です。最新局面に戻ると操作できます。");
+      return;
+    }
+
     if (gameStatus !== "playing") return;
     if (pendingPromotion) {
       setMessage("成る/成らないを選んでください。");
@@ -1419,6 +1678,11 @@ function App() {
   }
 
   function selectHandPiece(side: TeamSide, name: HandPieceName) {
+    if (reviewIndex !== null) {
+      setMessage("感想戦表示中です。最新局面に戻ると操作できます。");
+      return;
+    }
+
     if (gameStatus !== "playing") return;
     if (!canOperateNow(side)) {
       setMessage("現在指す人だけが持ち駒を選択できます。");
@@ -1454,6 +1718,7 @@ function App() {
   const lowerHandSide: TeamSide = viewerBottomSide;
 
   function getDisplayBoardCells() {
+    const displayBoard = reviewIndex !== null ? boardHistory[reviewIndex] ?? board : board;
     const cells: { row: number; col: number; square: Piece | null }[] = [];
 
     const rowOrder = viewerBottomSide === "black"
@@ -1466,15 +1731,23 @@ function App() {
 
     for (const row of rowOrder) {
       for (const col of colOrder) {
-        cells.push({ row, col, square: board[row][col] });
+        cells.push({ row, col, square: displayBoard[row][col] });
       }
     }
 
     return cells;
   }
 
+  function getDisplayedMove() {
+    if (reviewIndex !== null) {
+      return moveHistory.find((move) => move.moveNumber === reviewIndex) ?? null;
+    }
+
+    return moveHistory[0] ?? null;
+  }
+
   function isLastMoveDestination(row: number, col: number) {
-    const lastMove = moveHistory[0];
+    const lastMove = getDisplayedMove();
 
     if (!lastMove?.to) {
       return false;
@@ -1757,7 +2030,7 @@ function App() {
 
 
   function LastMovePanel() {
-    const lastMove = moveHistory[0];
+    const lastMove = getDisplayedMove();
 
     if (!lastMove) {
       return (
@@ -1788,12 +2061,64 @@ function App() {
           background: "#202734",
         }}
       >
-        <strong>直近の指し手</strong>
+        <strong>{reviewIndex !== null ? "表示中の指し手" : "直近の指し手"}</strong>
         <div style={{ marginTop: 6 }}>
           {lastMove.moveNumber}手目 / {getSideLabel(lastMove.side)} / {lastMove.playerName} / {lastMove.text}
           {lastMove.capturedPieceName ? `（${lastMove.capturedPieceName}を取得）` : ""}
         </div>
       </div>
+    );
+  }
+
+
+  function ReviewControls() {
+    if (boardHistory.length <= 1) {
+      return null;
+    }
+
+    const currentReviewIndex = reviewIndex ?? boardHistory.length - 1;
+    const displayedMove = getDisplayedMove();
+    const isLive = reviewIndex === null;
+
+    function setSafeReviewIndex(nextIndex: number | null) {
+      if (nextIndex === null) {
+        setReviewIndex(null);
+        return;
+      }
+
+      const safeIndex = Math.min(Math.max(nextIndex, 0), boardHistory.length - 1);
+      setReviewIndex(safeIndex);
+    }
+
+    return (
+      <section
+        style={{
+          maxWidth: 760,
+          margin: "12px auto",
+          padding: 12,
+          borderRadius: 12,
+          background: isLive ? "#24262b" : "#2b2a1f",
+          border: `1px solid ${isLive ? "#444" : "#ffd166"}`,
+        }}
+      >
+        <strong>感想戦</strong>
+        <p style={{ margin: "6px 0", color: "#ddd", fontSize: 13 }}>
+          {isLive
+            ? "現在は最新局面です。"
+            : `${currentReviewIndex}手目を表示中です。感想戦中は駒を動かせません。`}
+        </p>
+        {displayedMove && (
+          <p style={{ margin: "4px 0", color: "#bbb", fontSize: 13 }}>
+            表示中の手: {displayedMove.moveNumber}手目 / {getSideLabel(displayedMove.side)} / {displayedMove.text}
+          </p>
+        )}
+        <div style={{ display: "flex", justifyContent: "center", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+          <button onClick={() => setSafeReviewIndex(0)}>初期局面</button>
+          <button onClick={() => setSafeReviewIndex(currentReviewIndex - 1)}>一手戻る</button>
+          <button onClick={() => setSafeReviewIndex(currentReviewIndex + 1)}>一手進む</button>
+          <button onClick={() => setSafeReviewIndex(null)}>最新局面に戻る</button>
+        </div>
+      </section>
     );
   }
 
@@ -1916,7 +2241,70 @@ function App() {
         <button onClick={refreshParticipants} style={{ marginLeft: 8 }}>参加者再取得</button>
         <button onClick={reconnectAndResync} style={{ marginLeft: 8 }}>再接続/同期</button>
         <button onClick={() => setSoundEnabled((v) => !v)} style={{ marginLeft: 8 }}>{soundEnabled ? "効果音ON" : "効果音OFF"}</button>
+        <button onClick={() => setTimerSoundEnabled((v) => !v)} style={{ marginLeft: 8 }}>{timerSoundEnabled ? "時計音ON" : "時計音OFF"}</button>
       </div>
+
+      <section
+        style={{
+          maxWidth: 760,
+          margin: "12px auto 0",
+          padding: 12,
+          borderRadius: 10,
+          background: "#24262b",
+          border: "1px solid #444",
+        }}
+      >
+        <strong>BGM・通話メモ</strong>
+        <div style={{ marginTop: 8, display: "flex", justifyContent: "center", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            BGM
+            <select
+              value={bgmTrackId}
+              onChange={(event) => changeBgmTrack(event.target.value as BgmTrackId)}
+              disabled={!isCurrentUserHost()}
+            >
+              {BGM_TRACKS.map((track) => (
+                <option key={track.id} value={track.id}>{track.label}</option>
+              ))}
+            </select>
+          </label>
+
+          <button onClick={toggleServerBgm} disabled={!isCurrentUserHost() || bgmTrackId === "none"}>
+            {bgmEnabled ? "BGM停止" : "BGM再生"}
+          </button>
+
+          <button onClick={replayBgmLocally}>自分だけBGM再開</button>
+
+          <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            音量
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={bgmVolume}
+              onChange={(event) => setBgmVolume(Number(event.target.value))}
+            />
+          </label>
+
+          <button onClick={() => setTeamMuteNoticeEnabled((value) => !value)}>
+            {teamMuteNoticeEnabled ? "味方ミュート案内ON" : "味方ミュート案内OFF"}
+          </button>
+        </div>
+
+        <p style={{ margin: "8px 0 0", color: "#bbb", fontSize: 13 }}>
+          BGMファイルは <code>public/bgm/main.mp3</code> と <code>public/bgm/calm.mp3</code> に置くと全員が同じBGMを選べます。
+          ブラウザの仕様で自動再生が止まった場合は「自分だけBGM再開」を押してください。
+        </p>
+
+        {teamMuteNoticeEnabled && gameStatus === "playing" && currentTurn && getCurrentUserSide() === currentTurn.side && (
+          <p style={{ margin: "8px 0 0", color: "#ffd166", fontWeight: "bold" }}>
+            味方チームの手番です。相談禁止で遊ぶ場合は、味方はDiscord側でミュートしてください。
+          </p>
+        )}
+
+        {getSelectedBgmTrack().url && <audio ref={bgmAudioRef} src={getSelectedBgmTrack().url} loop />}
+      </section>
 
       <section
         style={{
@@ -2316,6 +2704,7 @@ function App() {
               <TurnBanner />
 
               <LastMovePanel />
+              <ReviewControls />
 
               <label style={{ display: "inline-flex", alignItems: "center", gap: 8, marginTop: 8 }}>
                 <input type="checkbox" checked={testFreeMoveMode} onChange={(event) => setTestFreeMoveMode(event.target.checked)} />
