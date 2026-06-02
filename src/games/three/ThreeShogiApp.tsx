@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { DiscordSDK } from "@discord/embedded-app-sdk";
 import { io, Socket } from "socket.io-client";
 
@@ -10,9 +11,22 @@ const discordSdk = isDiscordActivity ? new DiscordSDK(CLIENT_ID) : null;
 type Side = "red" | "blue" | "green";
 type GameStatus = "lobby" | "playing" | "finished";
 type PieceName = "歩" | "と" | "騎" | "角" | "飛" | "王";
-type Coord = { q: number; r: number };
-type Piece = { side: Side; name: PieceName; promoted?: boolean };
-type Cell = Coord & { key: string };
+
+type Coord = {
+  q: number;
+  r: number;
+};
+
+type Cell = Coord & {
+  key: string;
+};
+
+type Piece = {
+  side: Side;
+  name: PieceName;
+  promoted?: boolean;
+};
+
 type BoardMap = Record<string, Piece | null>;
 
 type Participant = {
@@ -37,12 +51,13 @@ type SyncState = {
   gameStatus: GameStatus;
   board: BoardMap;
   teams: Teams;
-  moveCount: number;
+  currentTurn: Side;
+  moveNumber: number;
   hostId: string | null;
   message: string;
   moveHistory: MoveRecord[];
   aliveSides: Side[];
-  soloTestMode: boolean;
+  pendingReturnSide: Side | null;
 };
 
 const SIDES: Side[] = ["red", "blue", "green"];
@@ -59,6 +74,7 @@ const SIDE_COLOR: Record<Side, string> = {
   green: "#7ee787",
 };
 
+// 六角マスの6方向
 const DIRS: Coord[] = [
   { q: 1, r: 0 },
   { q: 1, r: -1 },
@@ -68,36 +84,51 @@ const DIRS: Coord[] = [
   { q: 0, r: 1 },
 ];
 
+// 各軍の前方向
 const FORWARD_DIR_INDEX: Record<Side, number> = {
-  red: 5,
-  blue: 1,
-  green: 3,
+  red: 2,
+  blue: 0,
+  green: 4,
 };
+
+const BOARD_RADIUS = 4;
+const CENTER_KEY = "0,0";
 
 function keyOf(c: Coord) {
   return `${c.q},${c.r}`;
 }
 
 function add(a: Coord, b: Coord, scale = 1): Coord {
-  return { q: a.q + b.q * scale, r: a.r + b.r * scale };
+  return {
+    q: a.q + b.q * scale,
+    r: a.r + b.r * scale,
+  };
 }
 
 function sameCoord(a: Coord, b: Coord) {
   return a.q === b.q && a.r === b.r;
 }
 
-function createCells(radius = 4): Cell[] {
+function createCells(radius = BOARD_RADIUS): Cell[] {
   const cells: Cell[] = [];
+
   for (let q = -radius; q <= radius; q++) {
     for (let r = -radius; r <= radius; r++) {
       const s = -q - r;
-      if (Math.abs(s) <= radius) cells.push({ q, r, key: keyOf({ q, r }) });
+      if (Math.abs(s) <= radius) {
+        cells.push({
+          q,
+          r,
+          key: keyOf({ q, r }),
+        });
+      }
     }
   }
+
   return cells;
 }
 
-const CELLS = createCells(4);
+const CELLS = createCells();
 const CELL_SET = new Set(CELLS.map((c) => c.key));
 
 function isInside(c: Coord) {
@@ -109,47 +140,60 @@ function createEmptyBoard(): BoardMap {
 }
 
 function cloneBoard(board: BoardMap): BoardMap {
-  return JSON.parse(JSON.stringify(board));
+  const next: BoardMap = {};
+  for (const key of Object.keys(board)) {
+    const p = board[key];
+    next[key] = p ? { ...p } : null;
+  }
+  return next;
 }
 
 function put(board: BoardMap, q: number, r: number, piece: Piece) {
-  board[keyOf({ q, r })] = piece;
+  const key = keyOf({ q, r });
+  if (CELL_SET.has(key)) {
+    board[key] = piece;
+  }
+}
+
+function rotate120(c: Coord): Coord {
+  return { q: c.r, r: -c.q - c.r };
+}
+
+function rotate240(c: Coord): Coord {
+  return rotate120(rotate120(c));
+}
+
+function putFormation(
+  board: BoardMap,
+  side: Side,
+  transform: (c: Coord) => Coord
+) {
+  const pieces: Array<{ c: Coord; name: PieceName }> = [
+    { c: { q: -2, r: 4 }, name: "騎" },
+    { c: { q: -1, r: 4 }, name: "角" },
+    { c: { q: 0, r: 4 }, name: "王" },
+    { c: { q: 1, r: 3 }, name: "飛" },
+    { c: { q: 2, r: 2 }, name: "騎" },
+
+    { c: { q: -2, r: 3 }, name: "歩" },
+    { c: { q: -1, r: 3 }, name: "歩" },
+    { c: { q: 0, r: 3 }, name: "歩" },
+    { c: { q: 1, r: 2 }, name: "歩" },
+    { c: { q: 2, r: 1 }, name: "歩" },
+  ];
+
+  for (const p of pieces) {
+    const pos = transform(p.c);
+    put(board, pos.q, pos.r, { side, name: p.name });
+  }
 }
 
 function createInitialBoard(): BoardMap {
   const board = createEmptyBoard();
 
-  // 配置はこの関数だけで調整できます。
-  // 画像の正確な配置が分かり次第、この座標だけ差し替えれば反映されます。
-  put(board, 0, -4, { side: "red", name: "王" });
-  put(board, -1, -3, { side: "red", name: "角" });
-  put(board, 0, -3, { side: "red", name: "騎" });
-  put(board, 1, -3, { side: "red", name: "飛" });
-  put(board, -2, -2, { side: "red", name: "歩" });
-  put(board, -1, -2, { side: "red", name: "歩" });
-  put(board, 0, -2, { side: "red", name: "歩" });
-  put(board, 1, -2, { side: "red", name: "歩" });
-  put(board, 2, -2, { side: "red", name: "歩" });
-
-  put(board, -4, 0, { side: "blue", name: "王" });
-  put(board, -3, 1, { side: "blue", name: "角" });
-  put(board, -3, 0, { side: "blue", name: "騎" });
-  put(board, -3, -1, { side: "blue", name: "飛" });
-  put(board, -2, 2, { side: "blue", name: "歩" });
-  put(board, -2, 1, { side: "blue", name: "歩" });
-  put(board, -2, 0, { side: "blue", name: "歩" });
-  put(board, -2, -1, { side: "blue", name: "歩" });
-  put(board, -2, -2, { side: "blue", name: "歩" });
-
-  put(board, 4, 0, { side: "green", name: "王" });
-  put(board, 3, -1, { side: "green", name: "角" });
-  put(board, 3, 0, { side: "green", name: "騎" });
-  put(board, 3, 1, { side: "green", name: "飛" });
-  put(board, 2, -2, { side: "green", name: "歩" });
-  put(board, 2, -1, { side: "green", name: "歩" });
-  put(board, 2, 0, { side: "green", name: "歩" });
-  put(board, 2, 1, { side: "green", name: "歩" });
-  put(board, 2, 2, { side: "green", name: "歩" });
+  putFormation(board, "red", (c) => c);
+  putFormation(board, "blue", rotate120);
+  putFormation(board, "green", rotate240);
 
   return board;
 }
@@ -159,40 +203,33 @@ function getDisplayName(user: Participant | null | undefined) {
   return user.global_name || user.username || `user-${user.id}`;
 }
 
-function nextSide(current: Side, aliveSides: Side[]) {
-  const start = SIDES.indexOf(current);
-  for (let i = 1; i <= SIDES.length; i++) {
-    const candidate = SIDES[(start + i) % SIDES.length];
-    if (aliveSides.includes(candidate)) return candidate;
-  }
-  return current;
-}
-
-function getTurnSide(moveCount: number, aliveSides: Side[]) {
-  const alive = aliveSides.length ? aliveSides : SIDES;
-  let side: Side = "red";
-  for (let i = 0; i < moveCount; i++) side = nextSide(side, alive);
-  return side;
-}
-
-function getForward(side: Side) {
-  return DIRS[FORWARD_DIR_INDEX[side]];
-}
-
 function getRelativeDirs(side: Side) {
   const f = FORWARD_DIR_INDEX[side];
+
   return {
     forward: DIRS[f],
+    forwardLeft: DIRS[(f + 1) % 6],
+    forwardRight: DIRS[(f + 5) % 6],
     back: DIRS[(f + 3) % 6],
     left: DIRS[(f + 2) % 6],
     right: DIRS[(f + 4) % 6],
-    forwardLeft: DIRS[(f + 1) % 6],
-    forwardRight: DIRS[(f + 5) % 6],
   };
 }
 
 function coordDiff(from: Coord, to: Coord): Coord {
-  return { q: to.q - from.q, r: to.r - from.r };
+  return {
+    q: to.q - from.q,
+    r: to.r - from.r,
+  };
+}
+
+function hexDistance(a: Coord, b: Coord) {
+  const diff = coordDiff(a, b);
+  return Math.max(
+    Math.abs(diff.q),
+    Math.abs(diff.r),
+    Math.abs(-diff.q - diff.r)
+  );
 }
 
 function isSameDirection(diff: Coord, dir: Coord) {
@@ -200,26 +237,44 @@ function isSameDirection(diff: Coord, dir: Coord) {
   if (dir.r === 0 && diff.r !== 0) return false;
 
   let k: number | null = null;
-  if (dir.q !== 0) k = diff.q / dir.q;
-  else if (dir.r !== 0) k = diff.r / dir.r;
+
+  if (dir.q !== 0) {
+    k = diff.q / dir.q;
+  } else if (dir.r !== 0) {
+    k = diff.r / dir.r;
+  }
 
   if (k === null) return false;
   if (!Number.isInteger(k) || k <= 0) return false;
 
-  return (dir.q === 0 || diff.q === dir.q * k) && (dir.r === 0 || diff.r === dir.r * k);
+  return (
+    (dir.q === 0 || diff.q === dir.q * k) &&
+    (dir.r === 0 || diff.r === dir.r * k)
+  );
 }
 
 function stepCount(diff: Coord, dir: Coord) {
   if (!isSameDirection(diff, dir)) return 0;
-  return Math.max(Math.abs(dir.q ? diff.q / dir.q : 0), Math.abs(dir.r ? diff.r / dir.r : 0));
+
+  if (dir.q !== 0) return Math.abs(diff.q / dir.q);
+  if (dir.r !== 0) return Math.abs(diff.r / dir.r);
+
+  return 0;
 }
 
-function isPathClear(board: BoardMap, from: Coord, to: Coord, dir: Coord, jumpEveryOther = false) {
+function isPathClear(
+  board: BoardMap,
+  from: Coord,
+  to: Coord,
+  dir: Coord,
+  jumpEveryOther = false
+) {
   const n = stepCount(coordDiff(from, to), dir);
   if (n <= 1) return true;
 
   for (let i = 1; i < n; i++) {
     if (jumpEveryOther && i % 2 === 1) continue;
+
     const mid = add(from, dir, i);
     if (board[keyOf(mid)]) return false;
   }
@@ -227,7 +282,26 @@ function isPathClear(board: BoardMap, from: Coord, to: Coord, dir: Coord, jumpEv
   return true;
 }
 
-function isLegalMove(board: BoardMap, piece: Piece, from: Coord, to: Coord) {
+function getHorizontalDirs(side: Side) {
+  const rel = getRelativeDirs(side);
+  return [rel.left, rel.right];
+}
+
+function getDiagonalDirs(side: Side) {
+  const horizontal = getHorizontalDirs(side);
+  return DIRS.filter(
+    (dir) =>
+      !sameCoord(dir, horizontal[0]) &&
+      !sameCoord(dir, horizontal[1])
+  );
+}
+
+function isLegalPieceMove(
+  board: BoardMap,
+  piece: Piece,
+  from: Coord,
+  to: Coord
+) {
   if (!isInside(to)) return false;
   if (sameCoord(from, to)) return false;
 
@@ -235,32 +309,53 @@ function isLegalMove(board: BoardMap, piece: Piece, from: Coord, to: Coord) {
   if (target?.side === piece.side) return false;
 
   const diff = coordDiff(from, to);
-  const abs = Math.max(Math.abs(diff.q), Math.abs(diff.r), Math.abs(-diff.q - diff.r));
   const rel = getRelativeDirs(piece.side);
+  const distance = hexDistance(from, to);
 
-  if (piece.name === "王") return abs === 1;
-  if (piece.name === "と") return abs === 1;
-  if (piece.name === "歩") return sameCoord(diff, getForward(piece.side));
+  if (piece.name === "王") {
+    return distance === 1;
+  }
 
+  if (piece.name === "と") {
+    return distance === 1;
+  }
+
+  // 歩：前斜めに1マス
+  if (piece.name === "歩") {
+    return (
+      sameCoord(diff, rel.forwardLeft) ||
+      sameCoord(diff, rel.forwardRight)
+    );
+  }
+
+  // 騎：旧「弓兵」。6方向に2マスジャンプ
   if (piece.name === "騎") {
-    const candidates = [
-      add(add({ q: 0, r: 0 }, rel.forward, 2), rel.forwardLeft, 1),
-      add(add({ q: 0, r: 0 }, rel.forward, 2), rel.forwardRight, 1),
-      add(add({ q: 0, r: 0 }, rel.back, 2), rel.left, 1),
-      add(add({ q: 0, r: 0 }, rel.back, 2), rel.right, 1),
-    ];
-    return candidates.some((c) => sameCoord(c, diff));
+    return DIRS.some((dir) => sameCoord(diff, add({ q: 0, r: 0 }, dir, 2)));
   }
 
+  // 角：旧「騎兵」。斜め4方向に何マスでも
   if (piece.name === "角") {
-    return DIRS.some((dir) => isSameDirection(diff, dir) && isPathClear(board, from, to, dir));
+    return getDiagonalDirs(piece.side).some(
+      (dir) =>
+        isSameDirection(diff, dir) &&
+        isPathClear(board, from, to, dir)
+    );
   }
 
+  // 飛：横に何マスでも。前後は1マス飛びずつ何マスでも
   if (piece.name === "飛") {
-    const sideDirs = [rel.left, rel.right];
+    const horizontalDirs = getHorizontalDirs(piece.side);
     const frontBackDirs = [rel.forward, rel.back];
 
-    if (sideDirs.some((dir) => isSameDirection(diff, dir) && isPathClear(board, from, to, dir))) return true;
+    if (
+      horizontalDirs.some(
+        (dir) =>
+          isSameDirection(diff, dir) &&
+          isPathClear(board, from, to, dir)
+      )
+    ) {
+      return true;
+    }
 
     return frontBackDirs.some((dir) => {
       const n = stepCount(diff, dir);
@@ -273,27 +368,164 @@ function isLegalMove(board: BoardMap, piece: Piece, from: Coord, to: Coord) {
 
 function shouldPromote(piece: Piece, to: Coord) {
   if (piece.name !== "歩") return false;
-  if (to.q === 0 && to.r === 0) return true;
-  if (piece.side === "red" && to.r >= 2) return true;
+
+  if (keyOf(to) === CENTER_KEY) return true;
+
+  if (piece.side === "red" && to.r <= -2) return true;
   if (piece.side === "blue" && to.q >= 2) return true;
   if (piece.side === "green" && to.q <= -2) return true;
+
   return false;
 }
 
-function getCellPixel(c: Coord) {
-  const size = 31;
-  const x = size * Math.sqrt(3) * (c.q + c.r / 2);
-  const y = size * 1.5 * c.r;
-  return { x: x + 255, y: y + 255 };
+function findKing(board: BoardMap, side: Side): Coord | null {
+  for (const cell of CELLS) {
+    const p = board[cell.key];
+    if (p?.side === side && p.name === "王") {
+      return { q: cell.q, r: cell.r };
+    }
+  }
+
+  return null;
 }
 
-function makeSoloTeams(currentUser: Participant | null): Teams {
-  const baseName = currentUser ? getDisplayName(currentUser) : "テストユーザー";
+function isSideInCheck(board: BoardMap, side: Side, aliveSides: Side[]) {
+  const king = findKing(board, side);
+  if (!king) return false;
+
+  for (const cell of CELLS) {
+    const p = board[cell.key];
+    if (!p) continue;
+    if (p.side === side) continue;
+    if (!aliveSides.includes(p.side)) continue;
+
+    if (isLegalPieceMove(board, p, cell, king)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function simulateMove(
+  board: BoardMap,
+  from: Coord,
+  to: Coord
+): BoardMap {
+  const next = cloneBoard(board);
+  const moving = next[keyOf(from)];
+  if (!moving) return next;
+
+  next[keyOf(from)] = null;
+  next[keyOf(to)] = shouldPromote(moving, to)
+    ? { ...moving, name: "と", promoted: true }
+    : moving;
+
+  return next;
+}
+
+function isLegalMoveConsideringCheck(
+  board: BoardMap,
+  piece: Piece,
+  from: Coord,
+  to: Coord,
+  aliveSides: Side[]
+) {
+  if (!isLegalPieceMove(board, piece, from, to)) return false;
+
+  const next = simulateMove(board, from, to);
+
+  // 王が中央に入る手は勝利なので許可
+  if (piece.name === "王" && keyOf(to) === CENTER_KEY) {
+    return true;
+  }
+
+  return !isSideInCheck(next, piece.side, aliveSides);
+}
+
+function getLegalDestinations(
+  board: BoardMap,
+  from: Coord,
+  aliveSides: Side[]
+) {
+  const piece = board[keyOf(from)];
+  if (!piece) return [];
+
+  return CELLS.filter((cell) =>
+    isLegalMoveConsideringCheck(board, piece, from, cell, aliveSides)
+  );
+}
+
+function hasAnyLegalMove(board: BoardMap, side: Side, aliveSides: Side[]) {
+  for (const cell of CELLS) {
+    const p = board[cell.key];
+    if (!p || p.side !== side) continue;
+
+    const moves = getLegalDestinations(board, cell, aliveSides);
+    if (moves.length > 0) return true;
+  }
+
+  return false;
+}
+
+function removeSidePieces(board: BoardMap, side: Side) {
+  const next = cloneBoard(board);
+
+  for (const key of Object.keys(next)) {
+    if (next[key]?.side === side) {
+      next[key] = null;
+    }
+  }
+
+  return next;
+}
+
+function nextNormalSide(from: Side, aliveSides: Side[]) {
+  const start = SIDES.indexOf(from);
+
+  for (let i = 1; i <= SIDES.length; i++) {
+    const candidate = SIDES[(start + i) % SIDES.length];
+    if (aliveSides.includes(candidate)) return candidate;
+  }
+
+  return from;
+}
+
+function firstCheckedSideBy(
+  board: BoardMap,
+  attacker: Side,
+  aliveSides: Side[]
+): Side | null {
+  for (const side of SIDES) {
+    if (side === attacker) continue;
+    if (!aliveSides.includes(side)) continue;
+    if (isSideInCheck(board, side, aliveSides)) {
+      return side;
+    }
+  }
+
+  return null;
+}
+
+function getCellPixel(c: Coord) {
+  const size = 34;
+  const x = size * Math.sqrt(3) * (c.q + c.r / 2);
+  const y = size * 1.5 * c.r;
+
   return {
-    red: [{ id: currentUser?.id ?? "solo-red", username: `${baseName} / 赤軍` }],
-    blue: [{ id: "solo-blue", username: `${baseName} / 青軍` }],
-    green: [{ id: "solo-green", username: `${baseName} / 緑軍` }],
+    x: x + 310,
+    y: y + 310,
   };
+}
+
+function getMoveMarkForPiece(piece: Piece) {
+  if (piece.name === "歩") return "●";
+  if (piece.name === "と") return "●";
+  if (piece.name === "騎") return "●";
+  if (piece.name === "角") return "↗";
+  if (piece.name === "飛") return "➜";
+  if (piece.name === "王") return "●";
+  return "●";
 }
 
 export default function ThreeShogiApp() {
@@ -303,39 +535,56 @@ export default function ThreeShogiApp() {
   const [status, setStatus] = useState("起動中...");
   const [socketStatus, setSocketStatus] = useState("Socket未接続");
   const [currentUser, setCurrentUser] = useState<Participant | null>(null);
+
   const [hostId, setHostId] = useState<string | null>(null);
   const [gameStatus, setGameStatus] = useState<GameStatus>("lobby");
   const [teams, setTeams] = useState<Teams>({ red: [], blue: [], green: [] });
   const [board, setBoard] = useState<BoardMap>(createInitialBoard());
   const [selected, setSelected] = useState<Coord | null>(null);
-  const [moveCount, setMoveCount] = useState(0);
-  const [message, setMessage] = useState("三人将棋のロビーです。3軍に参加して開始してください。");
+  const [currentTurn, setCurrentTurn] = useState<Side>("red");
+  const [moveNumber, setMoveNumber] = useState(0);
+  const [message, setMessage] = useState(
+    "三人将棋ベータ版です。まずは軍に参加してください。"
+  );
   const [moveHistory, setMoveHistory] = useState<MoveRecord[]>([]);
   const [aliveSides, setAliveSides] = useState<Side[]>(SIDES);
-  const [freeMoveMode, setFreeMoveMode] = useState(false);
-  const [soloTestMode, setSoloTestMode] = useState(false);
+  const [pendingReturnSide, setPendingReturnSide] = useState<Side | null>(null);
+  const [freeMoveMode, setFreeMoveMode] = useState(true);
 
   const isHost = !!currentUser && currentUser.id === hostId;
-  const canControlGame = isHost || soloTestMode || !isDiscordActivity;
-
-  const turnSide = useMemo(() => getTurnSide(moveCount, aliveSides), [moveCount, aliveSides]);
 
   const mySide = useMemo(() => {
     if (!currentUser) return null;
-    return SIDES.find((side) => teams[side].some((u) => u.id === currentUser.id)) ?? null;
+
+    return (
+      SIDES.find((side) =>
+        teams[side].some((u) => u.id === currentUser.id)
+      ) ?? null
+    );
   }, [currentUser, teams]);
+
+  const legalDestinations = useMemo(() => {
+    if (!selected) return [];
+    return getLegalDestinations(board, selected, aliveSides);
+  }, [selected, board, aliveSides]);
+
+  const legalDestinationKeys = useMemo(
+    () => new Set(legalDestinations.map((c) => c.key)),
+    [legalDestinations]
+  );
 
   function emitSync(next: Partial<SyncState>) {
     const state: SyncState = {
       gameStatus,
       board,
       teams,
-      moveCount,
+      currentTurn,
+      moveNumber,
       hostId,
       message,
       moveHistory,
       aliveSides,
-      soloTestMode,
+      pendingReturnSide,
       ...next,
     };
 
@@ -346,7 +595,10 @@ export default function ThreeShogiApp() {
   }
 
   useEffect(() => {
-    const socket = io(SOCKET_URL, { transports: ["websocket", "polling"] });
+    const socket = io(SOCKET_URL, {
+      transports: ["websocket", "polling"],
+    });
+
     socketRef.current = socket;
 
     socket.on("connect", () => {
@@ -354,32 +606,47 @@ export default function ThreeShogiApp() {
       socket.emit("join-room", roomIdRef.current);
     });
 
-    socket.on("connect_error", () => setSocketStatus("Socketエラー"));
+    socket.on("connect_error", () => {
+      setSocketStatus("Socketエラー");
+    });
 
     socket.on("game-state", (state: SyncState) => {
       if (!state) return;
+
       setGameStatus(state.gameStatus);
       setBoard(state.board);
       setTeams(state.teams);
-      setMoveCount(state.moveCount);
+      setCurrentTurn(state.currentTurn);
+      setMoveNumber(state.moveNumber);
       setHostId(state.hostId);
       setMessage(state.message);
       setMoveHistory(state.moveHistory ?? []);
       setAliveSides(state.aliveSides ?? SIDES);
-      setSoloTestMode(state.soloTestMode ?? false);
+      setPendingReturnSide(state.pendingReturnSide ?? null);
+      setSelected(null);
     });
 
     async function boot() {
       if (!discordSdk) {
-        const localUser: Participant = { id: "local-user", username: "local-user" };
+        const localUser: Participant = {
+          id: "local-user",
+          username: "local-user",
+        };
+
         setCurrentUser(localUser);
         setHostId(localUser.id);
         setStatus("ローカル起動中");
-        socket.emit("register-user", { roomId: roomIdRef.current, userId: localUser.id });
+
+        socket.emit("register-user", {
+          roomId: roomIdRef.current,
+          userId: localUser.id,
+        });
+
         return;
       }
 
       await discordSdk.ready();
+
       const { code } = await discordSdk.commands.authorize({
         client_id: CLIENT_ID,
         response_type: "code",
@@ -401,7 +668,11 @@ export default function ThreeShogiApp() {
       setCurrentUser(me);
       setHostId((prev) => prev ?? me.id);
       setStatus("Discord Activity起動中");
-      socket.emit("register-user", { roomId: roomIdRef.current, userId: me.id });
+
+      socket.emit("register-user", {
+        roomId: roomIdRef.current,
+        userId: me.id,
+      });
     }
 
     boot().catch((e) => {
@@ -418,66 +689,167 @@ export default function ThreeShogiApp() {
     if (!currentUser || gameStatus !== "lobby") return;
 
     const nextTeams: Teams = { red: [], blue: [], green: [] };
-    for (const s of SIDES) nextTeams[s] = teams[s].filter((u) => u.id !== currentUser.id);
+
+    for (const s of SIDES) {
+      nextTeams[s] = teams[s].filter((u) => u.id !== currentUser.id);
+    }
+
     nextTeams[side] = [...nextTeams[side], currentUser];
 
     const nextMessage = `${getDisplayName(currentUser)} が${SIDE_LABEL[side]}に参加しました。`;
+
     setTeams(nextTeams);
     setMessage(nextMessage);
-    setSoloTestMode(false);
-    emitSync({ teams: nextTeams, message: nextMessage, soloTestMode: false });
+
+    emitSync({
+      teams: nextTeams,
+      message: nextMessage,
+    });
   }
 
-  function setupSoloTest() {
-    const nextTeams = makeSoloTeams(currentUser);
-    const nextMessage = "一人テスト用に3軍へ参加しました。自由移動をONにすると全軍の駒を動かせます。";
+  function joinAllForSoloTest() {
+    if (!currentUser || gameStatus !== "lobby") return;
+
+    const nextTeams: Teams = {
+      red: [{ ...currentUser, username: "赤軍テスト" }],
+      blue: [{ ...currentUser, username: "青軍テスト" }],
+      green: [{ ...currentUser, username: "緑軍テスト" }],
+    };
+
     setTeams(nextTeams);
-    setSoloTestMode(true);
     setFreeMoveMode(true);
-    setMessage(nextMessage);
-    emitSync({ teams: nextTeams, soloTestMode: true, message: nextMessage });
+    setMessage("一人テスト用に3軍すべてへ参加しました。");
+
+    emitSync({
+      teams: nextTeams,
+      message: "一人テスト用に3軍すべてへ参加しました。",
+    });
   }
 
   function resetGame() {
-    if (!canControlGame) return;
+    if (!isHost) return;
+
     const nextBoard = createInitialBoard();
-    const nextMessage = "盤面を初期化しました。";
+
     setGameStatus("lobby");
     setBoard(nextBoard);
     setSelected(null);
-    setMoveCount(0);
+    setCurrentTurn("red");
+    setMoveNumber(0);
     setMoveHistory([]);
     setAliveSides(SIDES);
-    setMessage(nextMessage);
-    emitSync({ gameStatus: "lobby", board: nextBoard, moveCount: 0, moveHistory: [], aliveSides: SIDES, message: nextMessage });
+    setPendingReturnSide(null);
+    setMessage("盤面を初期化しました。");
+
+    emitSync({
+      gameStatus: "lobby",
+      board: nextBoard,
+      currentTurn: "red",
+      moveNumber: 0,
+      moveHistory: [],
+      aliveSides: SIDES,
+      pendingReturnSide: null,
+      message: "盤面を初期化しました。",
+    });
   }
 
   function startGame() {
-    if (!canControlGame) {
-      setMessage("ホストだけが対局を開始できます。自分だけで試す場合は『一人テスト参加』を押してください。");
-      return;
-    }
+    if (!isHost) return;
 
-    const joined = SIDES.filter((s) => teams[s].length > 0);
-    if (joined.length < 3) {
-      setMessage("3軍すべてに最低1人ずつ参加してから開始してください。一人で試す場合は『一人テスト参加』を使ってください。");
+    const joinedSides = SIDES.filter((s) => teams[s].length > 0);
+
+    if (joinedSides.length < 3 && !freeMoveMode) {
+      setMessage("3軍すべてに最低1人ずつ参加してから開始してください。");
       return;
     }
 
     const nextBoard = createInitialBoard();
+
     setGameStatus("playing");
     setBoard(nextBoard);
     setSelected(null);
-    setMoveCount(0);
+    setCurrentTurn("red");
+    setMoveNumber(0);
     setMoveHistory([]);
     setAliveSides(SIDES);
+    setPendingReturnSide(null);
     setMessage("対局開始。赤軍の手番です。");
-    emitSync({ gameStatus: "playing", board: nextBoard, moveCount: 0, moveHistory: [], aliveSides: SIDES, message: "対局開始。赤軍の手番です。" });
+
+    emitSync({
+      gameStatus: "playing",
+      board: nextBoard,
+      currentTurn: "red",
+      moveNumber: 0,
+      moveHistory: [],
+      aliveSides: SIDES,
+      pendingReturnSide: null,
+      message: "対局開始。赤軍の手番です。",
+    });
   }
 
-  function eliminateSide(side: Side, nextAlive: Side[]) {
-    if (nextAlive.length === 1) return `${SIDE_LABEL[side]}の王を取りました。${SIDE_LABEL[nextAlive[0]]}の勝利です。`;
-    return `${SIDE_LABEL[side]}の王を取りました。${SIDE_LABEL[side]}は脱落です。`;
+  function decideNextTurnAfterMove(
+    nextBoard: BoardMap,
+    mover: Side,
+    currentAlive: Side[],
+    currentPendingReturnSide: Side | null
+  ) {
+    const checkedSide = firstCheckedSideBy(nextBoard, mover, currentAlive);
+
+    if (checkedSide) {
+      if (!hasAnyLegalMove(nextBoard, checkedSide, currentAlive)) {
+        const aliveAfterMate = currentAlive.filter((s) => s !== checkedSide);
+        const boardAfterMate = removeSidePieces(nextBoard, checkedSide);
+
+        if (aliveAfterMate.length === 1) {
+          return {
+            board: boardAfterMate,
+            alive: aliveAfterMate,
+            nextTurn: aliveAfterMate[0],
+            nextPendingReturnSide: null,
+            status: "finished" as GameStatus,
+            extraMessage: `${SIDE_LABEL[checkedSide]}は詰みです。${SIDE_LABEL[aliveAfterMate[0]]}の勝利です。`,
+          };
+        }
+
+        return {
+          board: boardAfterMate,
+          alive: aliveAfterMate,
+          nextTurn: nextNormalSide(checkedSide, aliveAfterMate),
+          nextPendingReturnSide: null,
+          status: "playing" as GameStatus,
+          extraMessage: `${SIDE_LABEL[checkedSide]}は詰みです。次は${SIDE_LABEL[nextNormalSide(checkedSide, aliveAfterMate)]}の手番です。`,
+        };
+      }
+
+      return {
+        board: nextBoard,
+        alive: currentAlive,
+        nextTurn: checkedSide,
+        nextPendingReturnSide: mover,
+        status: "playing" as GameStatus,
+        extraMessage: `王手！すぐに${SIDE_LABEL[checkedSide]}の手番です。対応後、王手を返さなければ${SIDE_LABEL[mover]}に手番が戻ります。`,
+      };
+    }
+
+    if (currentPendingReturnSide && currentAlive.includes(currentPendingReturnSide)) {
+      return {
+        board: nextBoard,
+        alive: currentAlive,
+        nextTurn: currentPendingReturnSide,
+        nextPendingReturnSide: null,
+        status: "playing" as GameStatus,
+        extraMessage: `${SIDE_LABEL[currentPendingReturnSide]}に手番が戻ります。`,
+      };
+    }
+
+    return {
+      board: nextBoard,
+      alive: currentAlive,
+      nextTurn: nextNormalSide(mover, currentAlive),
+      nextPendingReturnSide: null,
+      status: "playing" as GameStatus,
+      extraMessage: `次は${SIDE_LABEL[nextNormalSide(mover, currentAlive)]}の手番です。`,
+    };
   }
 
   function onCellClick(cell: Cell) {
@@ -485,29 +857,38 @@ export default function ThreeShogiApp() {
 
     const piece = board[cell.key];
 
-    if (!freeMoveMode && !soloTestMode) {
-      if (!mySide) {
-        setMessage("先にどこかの軍に参加してください。");
-        return;
-      }
-      if (mySide !== turnSide) {
-        setMessage(`今は${SIDE_LABEL[turnSide]}の手番です。`);
-        return;
-      }
-    }
-
     if (!selected) {
       if (!piece) return;
-      if (!freeMoveMode && !soloTestMode && piece.side !== turnSide) {
-        setMessage(`今は${SIDE_LABEL[turnSide]}の駒だけ動かせます。`);
+
+      if (!freeMoveMode) {
+        if (!mySide) {
+          setMessage("先にどこかの軍に参加してください。");
+          return;
+        }
+
+        if (mySide !== currentTurn) {
+          setMessage(`今は${SIDE_LABEL[currentTurn]}の手番です。`);
+          return;
+        }
+
+        if (piece.side !== currentTurn) {
+          setMessage(`今は${SIDE_LABEL[currentTurn]}の駒だけ動かせます。`);
+          return;
+        }
+      } else if (piece.side !== currentTurn) {
+        setMessage(
+          `テスト自由移動中ですが、手番は${SIDE_LABEL[currentTurn]}です。手番の駒を選んでください。`
+        );
         return;
       }
+
       setSelected(cell);
       setMessage(`${SIDE_LABEL[piece.side]}の${piece.name}を選択しました。`);
       return;
     }
 
     const fromPiece = board[keyOf(selected)];
+
     if (!fromPiece) {
       setSelected(null);
       return;
@@ -519,162 +900,247 @@ export default function ThreeShogiApp() {
       return;
     }
 
-    if (!isLegalMove(board, fromPiece, selected, cell)) {
-      setMessage("その動きはできません。駒の動きを確認してください。テスト時は『自由移動』をONにしても、駒の動き自体は判定されます。");
+    if (
+      !isLegalMoveConsideringCheck(
+        board,
+        fromPiece,
+        selected,
+        cell,
+        aliveSides
+      )
+    ) {
+      setMessage("その動きはできません。駒の動き、または王手の状態を確認してください。");
       return;
     }
 
-    const nextBoard = cloneBoard(board);
-    const captured = nextBoard[cell.key];
-    const movedPiece: Piece = shouldPromote(fromPiece, cell) ? { ...fromPiece, name: "と", promoted: true } : fromPiece;
+    const captured = board[cell.key];
+
+    let nextBoard = cloneBoard(board);
+    const movedPiece: Piece = shouldPromote(fromPiece, cell)
+      ? { ...fromPiece, name: "と", promoted: true }
+      : fromPiece;
+
     nextBoard[keyOf(selected)] = null;
     nextBoard[cell.key] = movedPiece;
 
-    let nextAlive = aliveSides;
-    let nextStatus: GameStatus = "playing";
+    let nextAliveSides = [...aliveSides];
+    let nextGameStatus: GameStatus = "playing";
+    let nextTurn = currentTurn;
+    let nextPendingReturnSide: Side | null = pendingReturnSide;
+
     let resultText = "";
 
-    if (captured?.name === "王") {
-      nextAlive = aliveSides.filter((s) => s !== captured.side);
-      resultText = eliminateSide(captured.side, nextAlive);
-      if (nextAlive.length === 1) nextStatus = "finished";
+    if (movedPiece.name === "王" && cell.key === CENTER_KEY) {
+      nextGameStatus = "finished";
+      resultText = `${SIDE_LABEL[fromPiece.side]}の王が中央マスに入りました。${SIDE_LABEL[fromPiece.side]}の勝利です。`;
+    } else if (captured?.name === "王") {
+      nextAliveSides = aliveSides.filter((s) => s !== captured.side);
+      nextBoard = removeSidePieces(nextBoard, captured.side);
+
+      if (nextAliveSides.length === 1) {
+        nextGameStatus = "finished";
+        resultText = `${SIDE_LABEL[captured.side]}の王を取りました。${SIDE_LABEL[nextAliveSides[0]]}の勝利です。`;
+      } else {
+        nextTurn = nextNormalSide(captured.side, nextAliveSides);
+        nextPendingReturnSide = null;
+        resultText = `${SIDE_LABEL[captured.side]}は脱落しました。次は${SIDE_LABEL[nextTurn]}の手番です。`;
+      }
+    } else {
+      const decision = decideNextTurnAfterMove(
+        nextBoard,
+        fromPiece.side,
+        nextAliveSides,
+        pendingReturnSide
+      );
+
+      nextBoard = decision.board;
+      nextAliveSides = decision.alive;
+      nextTurn = decision.nextTurn;
+      nextPendingReturnSide = decision.nextPendingReturnSide;
+      nextGameStatus = decision.status;
+      resultText = decision.extraMessage;
     }
 
-    const nextMoveCount = moveCount + 1;
-    const movedText = `${SIDE_LABEL[fromPiece.side]} ${fromPiece.name}${captured ? `x${captured.name}` : ""} (${selected.q},${selected.r})→(${cell.q},${cell.r})`;
-    const nextHistory = [
+    const nextMoveNumber = moveNumber + 1;
+
+    const moveText = `${SIDE_LABEL[fromPiece.side]} ${fromPiece.name}${
+      captured ? `x${captured.name}` : ""
+    } (${selected.q},${selected.r})→(${cell.q},${cell.r})`;
+
+    const nextHistory: MoveRecord[] = [
       ...moveHistory,
-      { moveNumber: nextMoveCount, side: fromPiece.side, playerName: getDisplayName(currentUser), text: movedText },
+      {
+        moveNumber: nextMoveNumber,
+        side: fromPiece.side,
+        playerName: getDisplayName(currentUser),
+        text: moveText,
+      },
     ];
-    const followingSide = nextStatus === "finished" ? fromPiece.side : getTurnSide(nextMoveCount, nextAlive);
-    const nextMessage = resultText || `${movedText}。次は${SIDE_LABEL[followingSide]}の手番です。`;
+
+    const nextMessage = `${moveText}。${resultText}`;
 
     setBoard(nextBoard);
     setSelected(null);
-    setMoveCount(nextMoveCount);
+    setCurrentTurn(nextTurn);
+    setMoveNumber(nextMoveNumber);
     setMoveHistory(nextHistory);
-    setAliveSides(nextAlive);
-    setGameStatus(nextStatus);
+    setAliveSides(nextAliveSides);
+    setPendingReturnSide(nextPendingReturnSide);
+    setGameStatus(nextGameStatus);
     setMessage(nextMessage);
-    emitSync({ board: nextBoard, moveCount: nextMoveCount, moveHistory: nextHistory, aliveSides: nextAlive, gameStatus: nextStatus, message: nextMessage });
+
+    emitSync({
+      board: nextBoard,
+      currentTurn: nextTurn,
+      moveNumber: nextMoveNumber,
+      moveHistory: nextHistory,
+      aliveSides: nextAliveSides,
+      pendingReturnSide: nextPendingReturnSide,
+      gameStatus: nextGameStatus,
+      message: nextMessage,
+    });
   }
 
-  return (
-    <div className="three-shogi-root">
-      <style>{`
-        .three-shogi-root {
-          min-height: 100vh;
-          background: radial-gradient(circle at top, #172033 0%, #0d1117 45%, #05070a 100%);
-          color: #f0f6fc;
-          padding: 18px;
-          font-family: system-ui, sans-serif;
-          box-sizing: border-box;
-        }
-        .three-header {
-          display: flex;
-          justify-content: space-between;
-          gap: 16px;
-          align-items: center;
-          margin-bottom: 14px;
-          background: rgba(1, 4, 9, 0.72);
-          border: 1px solid #30363d;
-          border-radius: 16px;
-          padding: 14px;
-        }
-        .three-layout {
-          display: grid;
-          grid-template-columns: minmax(230px, 270px) minmax(520px, 1fr) minmax(240px, 300px);
-          gap: 14px;
-          align-items: start;
-        }
-        .three-panel {
-          background: rgba(1, 4, 9, 0.86);
-          border: 1px solid #30363d;
-          border-radius: 14px;
-          padding: 14px;
-          box-sizing: border-box;
-        }
-        .board-panel {
-          display: flex;
-          justify-content: center;
-          overflow: auto;
-          min-height: 560px;
-        }
-        .board-wrap {
-          position: relative;
-          width: 520px;
-          height: 520px;
-          flex: 0 0 auto;
-        }
-        @media (max-width: 1060px) {
-          .three-layout {
-            grid-template-columns: 1fr;
-          }
-          .board-panel {
-            order: -1;
-          }
-          .three-header {
-            align-items: flex-start;
-            flex-direction: column;
-          }
-        }
-      `}</style>
+  const boardSize = 660;
 
-      <header className="three-header">
+  return (
+    <div style={pageStyle}>
+      <header style={headerStyle}>
         <div>
-          <h1 style={{ margin: 0 }}>三人将棋</h1>
-          <div style={{ color: "#8b949e", fontSize: 13 }}>{status} / {socketStatus}</div>
-          <div style={{ color: "#c9d1d9", fontSize: 13, marginTop: 6 }}>{message}</div>
+          <h1 style={{ margin: 0 }}>三人将棋 ベータ版</h1>
+          <div style={{ color: "#8b949e", fontSize: 13 }}>
+            {status} / {socketStatus}
+          </div>
         </div>
+
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button onClick={startGame} style={buttonStyle("#238636")}>対局開始</button>
-          <button onClick={setupSoloTest} style={buttonStyle("#8957e5")}>一人テスト参加</button>
-          <button onClick={resetGame} style={buttonStyle("#30363d")}>初期化</button>
-          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
-            <input type="checkbox" checked={freeMoveMode} onChange={(e) => setFreeMoveMode(e.target.checked)} />
-            自由移動
+          {isHost && (
+            <button onClick={startGame} style={buttonStyle("#238636")}>
+              対局開始
+            </button>
+          )}
+
+          {isHost && (
+            <button onClick={resetGame} style={buttonStyle("#30363d")}>
+              初期化
+            </button>
+          )}
+
+          <label style={checkStyle}>
+            <input
+              type="checkbox"
+              checked={freeMoveMode}
+              onChange={(e) => setFreeMoveMode(e.target.checked)}
+            />
+            一人テスト
           </label>
         </div>
       </header>
 
-      <div className="three-layout">
-        <aside className="three-panel">
+      <div style={mainGridStyle}>
+        <aside style={panelStyle}>
           <h2 style={h2Style}>ロビー</h2>
-          <div style={{ marginBottom: 10, color: "#8b949e", fontSize: 13 }}>あなた: {getDisplayName(currentUser)}</div>
+
+          <div style={{ marginBottom: 10, color: "#8b949e", fontSize: 13 }}>
+            あなた: {getDisplayName(currentUser)}
+          </div>
+
           {SIDES.map((side) => (
-            <div key={side} style={{ border: `1px solid ${SIDE_COLOR[side]}`, borderRadius: 12, padding: 10, marginBottom: 10, background: "#0d1117" }}>
-              <div style={{ color: SIDE_COLOR[side], fontWeight: 900, marginBottom: 6 }}>{SIDE_LABEL[side]}</div>
-              <div style={{ minHeight: 24, fontSize: 13, lineHeight: 1.5 }}>{teams[side].map(getDisplayName).join(" / ") || "未参加"}</div>
-              <button disabled={gameStatus !== "lobby"} onClick={() => joinSide(side)} style={buttonStyle(SIDE_COLOR[side], true)}>この軍に入る</button>
+            <div
+              key={side}
+              style={{
+                border: `1px solid ${SIDE_COLOR[side]}`,
+                borderRadius: 10,
+                padding: 10,
+                marginBottom: 10,
+                background: "#0d1117",
+              }}
+            >
+              <div
+                style={{
+                  color: SIDE_COLOR[side],
+                  fontWeight: 800,
+                  marginBottom: 6,
+                }}
+              >
+                {SIDE_LABEL[side]}
+              </div>
+
+              <div style={{ minHeight: 24, fontSize: 13 }}>
+                {teams[side].map(getDisplayName).join(" / ") || "未参加"}
+              </div>
+
+              <button
+                disabled={gameStatus !== "lobby"}
+                onClick={() => joinSide(side)}
+                style={buttonStyle(SIDE_COLOR[side], true)}
+              >
+                この軍に入る
+              </button>
             </div>
           ))}
-          <div style={{ color: "#8b949e", fontSize: 12, lineHeight: 1.6 }}>
-            3軍すべてに参加者がいると開始できます。テスト時は「一人テスト参加」を押してください。
+
+          <button
+            disabled={gameStatus !== "lobby"}
+            onClick={joinAllForSoloTest}
+            style={{
+              ...buttonStyle("#f2cc60", true),
+              width: "100%",
+              marginTop: 4,
+            }}
+          >
+            一人テスト用に3軍参加
+          </button>
+
+          <div style={ruleBoxStyle}>
+            <b>勝利条件</b>
+            <br />
+            ・敵の王を取る
+            <br />
+            ・自分の王が中央マスに入る
+            <br />
+            ・最後の1軍になる
           </div>
         </aside>
 
-        <main className="three-panel board-panel">
-          <div className="board-wrap">
+        <main style={boardPanelStyle}>
+          <div style={{ position: "relative", width: boardSize, height: boardSize }}>
             {CELLS.map((cell) => {
               const p = getCellPixel(cell);
               const piece = board[cell.key];
-              const isSelected = selected && selected.q === cell.q && selected.r === cell.r;
-              const isCenter = cell.q === 0 && cell.r === 0;
+              const isSelected =
+                selected && selected.q === cell.q && selected.r === cell.r;
+              const isLegalDestination = legalDestinationKeys.has(cell.key);
+              const isCenter = cell.key === CENTER_KEY;
+
               return (
                 <button
                   key={cell.key}
                   onClick={() => onCellClick(cell)}
-                  title={`${cell.q},${cell.r}${isCenter ? " 中央マス" : ""}`}
+                  title={`${cell.q},${cell.r}`}
                   style={{
                     position: "absolute",
-                    left: p.x - 28,
-                    top: p.y - 28,
-                    width: 56,
-                    height: 56,
-                    clipPath: "polygon(25% 4%, 75% 4%, 100% 50%, 75% 96%, 25% 96%, 0% 50%)",
-                    border: isSelected ? "3px solid #f2cc60" : isCenter ? "3px solid #d29922" : "1px solid #30363d",
-                    background: piece ? "#f0e0b6" : isCenter ? "#3b2f12" : "#161b22",
-                    color: piece ? "#0d1117" : isCenter ? "#f2cc60" : "#8b949e",
+                    left: p.x - 30,
+                    top: p.y - 30,
+                    width: 60,
+                    height: 60,
+                    clipPath:
+                      "polygon(25% 4%, 75% 4%, 100% 50%, 75% 96%, 25% 96%, 0% 50%)",
+                    border: isSelected
+                      ? "3px solid #f2cc60"
+                      : isCenter
+                      ? "3px solid #ffdf5d"
+                      : isLegalDestination
+                      ? "2px solid #58a6ff"
+                      : "1px solid #30363d",
+                    background: piece
+                      ? "#f0e0b6"
+                      : isCenter
+                      ? "#4b3b10"
+                      : isLegalDestination
+                      ? "#102a43"
+                      : "#161b22",
+                    color: piece ? "#0d1117" : "#8b949e",
                     cursor: "pointer",
                     fontWeight: 900,
                     fontSize: 20,
@@ -682,18 +1148,28 @@ export default function ThreeShogiApp() {
                     flexDirection: "column",
                     alignItems: "center",
                     justifyContent: "center",
-                    boxShadow: isCenter ? "0 0 18px rgba(210,153,34,0.65)" : undefined,
+                    boxShadow: isCenter
+                      ? "0 0 18px rgba(255, 223, 93, 0.6)"
+                      : "none",
                   }}
                 >
                   {piece ? (
                     <>
-                      <span style={{ color: SIDE_COLOR[piece.side], fontSize: 11 }}>{SIDE_LABEL[piece.side].slice(0, 1)}</span>
+                      <span style={{ color: SIDE_COLOR[piece.side], fontSize: 11 }}>
+                        {SIDE_LABEL[piece.side].slice(0, 1)}
+                      </span>
                       <span>{piece.name}</span>
                     </>
+                  ) : isLegalDestination && selected ? (
+                    <span style={{ color: "#58a6ff", fontSize: 20 }}>
+                      {getMoveMarkForPiece(board[keyOf(selected)]!)}
+                    </span>
                   ) : isCenter ? (
-                    <span style={{ fontSize: 13 }}>中央</span>
+                    <span style={{ color: "#ffdf5d", fontSize: 12 }}>中央</span>
                   ) : (
-                    <span style={{ fontSize: 9 }}>{cell.q},{cell.r}</span>
+                    <span style={{ fontSize: 9 }}>
+                      {cell.q},{cell.r}
+                    </span>
                   )}
                 </button>
               );
@@ -701,24 +1177,68 @@ export default function ThreeShogiApp() {
           </div>
         </main>
 
-        <aside className="three-panel">
+        <aside style={panelStyle}>
           <h2 style={h2Style}>状態</h2>
-          <div style={{ marginBottom: 8 }}>状態: <b>{gameStatus}</b></div>
-          <div style={{ marginBottom: 8 }}>手番: <b style={{ color: SIDE_COLOR[turnSide] }}>{SIDE_LABEL[turnSide]}</b></div>
-          <div style={{ marginBottom: 8 }}>モード: <b>{soloTestMode ? "一人テスト" : "通常"}</b></div>
 
-          <div style={{ padding: 10, borderRadius: 10, background: "#161b22", marginBottom: 12, lineHeight: 1.6 }}>{message}</div>
+          <div style={{ marginBottom: 8 }}>
+            状態: <b>{gameStatus}</b>
+          </div>
+
+          <div style={{ marginBottom: 8 }}>
+            手番:{" "}
+            <b style={{ color: SIDE_COLOR[currentTurn] }}>
+              {SIDE_LABEL[currentTurn]}
+            </b>
+          </div>
+
+          {pendingReturnSide && (
+            <div style={{ marginBottom: 8, color: "#f2cc60" }}>
+              王手対応後、王手を返さなければ
+              {SIDE_LABEL[pendingReturnSide]}へ戻ります。
+            </div>
+          )}
+
+          <div style={messageStyle}>{message}</div>
+
+          <h2 style={h2Style}>駒の動き</h2>
+          <div style={ruleBoxStyle}>
+            歩：前斜め1マス
+            <br />
+            と：6方向1マス
+            <br />
+            騎：6方向に2マスジャンプ
+            <br />
+            角：斜め4方向に何マスでも
+            <br />
+            飛：横に何マスでも、前後は1マス飛び
+            <br />
+            王：6方向1マス
+          </div>
 
           <h2 style={h2Style}>棋譜</h2>
-          <div style={{ maxHeight: 360, overflow: "auto", fontSize: 13, lineHeight: 1.7 }}>
+
+          <div style={{ maxHeight: 250, overflow: "auto", fontSize: 13, lineHeight: 1.7 }}>
             {moveHistory.length === 0 ? (
               <div style={{ color: "#8b949e" }}>まだ指し手はありません。</div>
             ) : (
-              moveHistory.slice().reverse().map((m) => (
-                <div key={m.moveNumber} style={{ borderBottom: "1px solid #30363d", padding: "5px 0" }}>
-                  {m.moveNumber}. <span style={{ color: SIDE_COLOR[m.side] }}>{SIDE_LABEL[m.side]}</span> {m.text}
-                </div>
-              ))
+              moveHistory
+                .slice()
+                .reverse()
+                .map((m) => (
+                  <div
+                    key={m.moveNumber}
+                    style={{
+                      borderBottom: "1px solid #30363d",
+                      padding: "5px 0",
+                    }}
+                  >
+                    {m.moveNumber}.{" "}
+                    <span style={{ color: SIDE_COLOR[m.side] }}>
+                      {SIDE_LABEL[m.side]}
+                    </span>{" "}
+                    {m.text}
+                  </div>
+                ))
             )}
           </div>
         </aside>
@@ -727,7 +1247,7 @@ export default function ThreeShogiApp() {
   );
 }
 
-function buttonStyle(bg: string, darkText = false): React.CSSProperties {
+function buttonStyle(bg: string, darkText = false): CSSProperties {
   return {
     border: "none",
     borderRadius: 8,
@@ -740,7 +1260,71 @@ function buttonStyle(bg: string, darkText = false): React.CSSProperties {
   };
 }
 
-const h2Style: React.CSSProperties = {
+const pageStyle: CSSProperties = {
+  minHeight: "100vh",
+  background: "#0d1117",
+  color: "#f0f6fc",
+  padding: 18,
+  fontFamily: "system-ui, sans-serif",
+  boxSizing: "border-box",
+};
+
+const headerStyle: CSSProperties = {
+  display: "flex",
+  justifyContent: "space-between",
+  gap: 16,
+  alignItems: "center",
+  marginBottom: 14,
+};
+
+const mainGridStyle: CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "260px minmax(680px, 1fr) 310px",
+  gap: 16,
+  alignItems: "start",
+  overflowX: "auto",
+};
+
+const panelStyle: CSSProperties = {
+  background: "#010409",
+  border: "1px solid #30363d",
+  borderRadius: 14,
+  padding: 14,
+};
+
+const boardPanelStyle: CSSProperties = {
+  ...panelStyle,
+  display: "flex",
+  justifyContent: "center",
+  overflow: "auto",
+};
+
+const h2Style: CSSProperties = {
   fontSize: 16,
   margin: "0 0 10px",
+};
+
+const messageStyle: CSSProperties = {
+  padding: 10,
+  borderRadius: 10,
+  background: "#161b22",
+  marginBottom: 12,
+  lineHeight: 1.6,
+};
+
+const ruleBoxStyle: CSSProperties = {
+  marginTop: 12,
+  padding: 10,
+  borderRadius: 10,
+  background: "#161b22",
+  color: "#c9d1d9",
+  fontSize: 13,
+  lineHeight: 1.7,
+};
+
+const checkStyle: CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  fontSize: 13,
 };
