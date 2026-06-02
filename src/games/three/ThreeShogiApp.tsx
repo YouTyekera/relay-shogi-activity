@@ -5,6 +5,7 @@ import { io, Socket } from "socket.io-client";
 
 const CLIENT_ID = "1508095762242994317";
 const SOCKET_URL = "";
+
 const isDiscordActivity = window.location.search.includes("frame_id");
 const discordSdk = isDiscordActivity ? new DiscordSDK(CLIENT_ID) : null;
 
@@ -68,13 +69,20 @@ const SIDE_LABEL: Record<Side, string> = {
   green: "緑軍",
 };
 
+const SIDE_SHORT: Record<Side, string> = {
+  red: "赤",
+  blue: "青",
+  green: "緑",
+};
+
 const SIDE_COLOR: Record<Side, string> = {
   red: "#ff7b72",
-  blue: "#79c0ff",
+  blue: "#58a6ff",
   green: "#7ee787",
 };
 
-// 六角マスの6方向
+// 画面上の6方向
+// 0:右 / 1:右上 / 2:左上 / 3:左 / 4:左下 / 5:右下
 const DIRS: Coord[] = [
   { q: 1, r: 0 },
   { q: 1, r: -1 },
@@ -83,13 +91,6 @@ const DIRS: Coord[] = [
   { q: -1, r: 1 },
   { q: 0, r: 1 },
 ];
-
-// 各軍の前方向
-const FORWARD_DIR_INDEX: Record<Side, number> = {
-  red: 2,
-  blue: 0,
-  green: 4,
-};
 
 const BOARD_RADIUS = 4;
 const CENTER_KEY = "0,0";
@@ -116,11 +117,7 @@ function createCells(radius = BOARD_RADIUS): Cell[] {
     for (let r = -radius; r <= radius; r++) {
       const s = -q - r;
       if (Math.abs(s) <= radius) {
-        cells.push({
-          q,
-          r,
-          key: keyOf({ q, r }),
-        });
+        cells.push({ q, r, key: keyOf({ q, r }) });
       }
     }
   }
@@ -141,59 +138,79 @@ function createEmptyBoard(): BoardMap {
 
 function cloneBoard(board: BoardMap): BoardMap {
   const next: BoardMap = {};
+
   for (const key of Object.keys(board)) {
     const p = board[key];
     next[key] = p ? { ...p } : null;
   }
+
   return next;
 }
 
 function put(board: BoardMap, q: number, r: number, piece: Piece) {
   const key = keyOf({ q, r });
-  if (CELL_SET.has(key)) {
-    board[key] = piece;
-  }
-}
-
-function rotate120(c: Coord): Coord {
-  return { q: c.r, r: -c.q - c.r };
-}
-
-function rotate240(c: Coord): Coord {
-  return rotate120(rotate120(c));
-}
-
-function putFormation(
-  board: BoardMap,
-  side: Side,
-  transform: (c: Coord) => Coord
-) {
-  const pieces: Array<{ c: Coord; name: PieceName }> = [
-    { c: { q: -2, r: 4 }, name: "騎" },
-    { c: { q: -1, r: 4 }, name: "角" },
-    { c: { q: 0, r: 4 }, name: "王" },
-    { c: { q: 1, r: 3 }, name: "飛" },
-    { c: { q: 2, r: 2 }, name: "騎" },
-
-    { c: { q: -2, r: 3 }, name: "歩" },
-    { c: { q: -1, r: 3 }, name: "歩" },
-    { c: { q: 0, r: 3 }, name: "歩" },
-    { c: { q: 1, r: 2 }, name: "歩" },
-    { c: { q: 2, r: 1 }, name: "歩" },
-  ];
-
-  for (const p of pieces) {
-    const pos = transform(p.c);
-    put(board, pos.q, pos.r, { side, name: p.name });
-  }
+  if (CELL_SET.has(key)) board[key] = piece;
 }
 
 function createInitialBoard(): BoardMap {
   const board = createEmptyBoard();
 
-  putFormation(board, "red", (c) => c);
-  putFormation(board, "blue", rotate120);
-  putFormation(board, "green", rotate240);
+  // =====================================================
+  // 赤軍：下の辺
+  // 奥列 r=4 / 前列 r=3
+  // 赤軍は下から中央を見る。
+  // 王から見て左が角、右が飛。
+  // =====================================================
+  put(board, -4, 4, { side: "red", name: "騎" });
+  put(board, -3, 4, { side: "red", name: "角" });
+  put(board, -2, 4, { side: "red", name: "王" });
+  put(board, -1, 4, { side: "red", name: "飛" });
+  put(board, 0, 4, { side: "red", name: "騎" });
+
+  put(board, -4, 3, { side: "red", name: "歩" });
+  put(board, -3, 3, { side: "red", name: "歩" });
+  put(board, -2, 3, { side: "red", name: "歩" });
+  put(board, -1, 3, { side: "red", name: "歩" });
+  put(board, 0, 3, { side: "red", name: "歩" });
+  put(board, 1, 3, { side: "red", name: "歩" });
+
+  // =====================================================
+  // 青軍：右上の辺
+  // 奥列 q=4 / 前列 q=3
+  // 青軍は右上から中央を見る。
+  // 王から見て左が角、右が飛になるように配置。
+  // =====================================================
+  put(board, 4, -4, { side: "blue", name: "騎" });
+  put(board, 4, -3, { side: "blue", name: "飛" });
+  put(board, 4, -2, { side: "blue", name: "王" });
+  put(board, 4, -1, { side: "blue", name: "角" });
+  put(board, 4, 0, { side: "blue", name: "騎" });
+
+  put(board, 3, -4, { side: "blue", name: "歩" });
+  put(board, 3, -3, { side: "blue", name: "歩" });
+  put(board, 3, -2, { side: "blue", name: "歩" });
+  put(board, 3, -1, { side: "blue", name: "歩" });
+  put(board, 3, 0, { side: "blue", name: "歩" });
+  put(board, 3, 1, { side: "blue", name: "歩" });
+
+  // =====================================================
+  // 緑軍：左上の辺
+  // 奥列 q+r=-4 / 前列 q+r=-3
+  // 緑軍は左上から中央を見る。
+  // 王から見て左が角、右が飛になるように配置。
+  // =====================================================
+  put(board, -4, 0, { side: "green", name: "騎" });
+  put(board, -3, -1, { side: "green", name: "飛" });
+  put(board, -2, -2, { side: "green", name: "王" });
+  put(board, -1, -3, { side: "green", name: "角" });
+  put(board, 0, -4, { side: "green", name: "騎" });
+
+  put(board, -4, 1, { side: "green", name: "歩" });
+  put(board, -3, 0, { side: "green", name: "歩" });
+  put(board, -2, -1, { side: "green", name: "歩" });
+  put(board, -1, -2, { side: "green", name: "歩" });
+  put(board, 0, -3, { side: "green", name: "歩" });
+  put(board, 1, -4, { side: "green", name: "歩" });
 
   return board;
 }
@@ -203,17 +220,30 @@ function getDisplayName(user: Participant | null | undefined) {
   return user.global_name || user.username || `user-${user.id}`;
 }
 
-function getRelativeDirs(side: Side) {
-  const f = FORWARD_DIR_INDEX[side];
+function getSideAxisDirs(side: Side) {
+  if (side === "red") return [DIRS[0], DIRS[3]];
+  if (side === "blue") return [DIRS[2], DIRS[5]];
+  return [DIRS[1], DIRS[4]];
+}
 
-  return {
-    forward: DIRS[f],
-    forwardLeft: DIRS[(f + 1) % 6],
-    forwardRight: DIRS[(f + 5) % 6],
-    back: DIRS[(f + 3) % 6],
-    left: DIRS[(f + 2) % 6],
-    right: DIRS[(f + 4) % 6],
-  };
+function getPawnForwardDirs(side: Side) {
+  if (side === "red") return [DIRS[1], DIRS[2]];
+  if (side === "blue") return [DIRS[3], DIRS[4]];
+  return [DIRS[0], DIRS[5]];
+}
+
+function getBackDirs(side: Side) {
+  return getPawnForwardDirs(side).map((dir) => ({
+    q: -dir.q,
+    r: -dir.r,
+  }));
+}
+
+function getDiagonalDirs(side: Side) {
+  const axis = getSideAxisDirs(side);
+  return DIRS.filter(
+    (dir) => !sameCoord(dir, axis[0]) && !sameCoord(dir, axis[1])
+  );
 }
 
 function coordDiff(from: Coord, to: Coord): Coord {
@@ -255,10 +285,8 @@ function isSameDirection(diff: Coord, dir: Coord) {
 
 function stepCount(diff: Coord, dir: Coord) {
   if (!isSameDirection(diff, dir)) return 0;
-
   if (dir.q !== 0) return Math.abs(diff.q / dir.q);
   if (dir.r !== 0) return Math.abs(diff.r / dir.r);
-
   return 0;
 }
 
@@ -282,20 +310,6 @@ function isPathClear(
   return true;
 }
 
-function getHorizontalDirs(side: Side) {
-  const rel = getRelativeDirs(side);
-  return [rel.left, rel.right];
-}
-
-function getDiagonalDirs(side: Side) {
-  const horizontal = getHorizontalDirs(side);
-  return DIRS.filter(
-    (dir) =>
-      !sameCoord(dir, horizontal[0]) &&
-      !sameCoord(dir, horizontal[1])
-  );
-}
-
 function isLegalPieceMove(
   board: BoardMap,
   piece: Piece,
@@ -309,7 +323,6 @@ function isLegalPieceMove(
   if (target?.side === piece.side) return false;
 
   const diff = coordDiff(from, to);
-  const rel = getRelativeDirs(piece.side);
   const distance = hexDistance(from, to);
 
   if (piece.name === "王") {
@@ -320,12 +333,9 @@ function isLegalPieceMove(
     return distance === 1;
   }
 
-  // 歩：前斜めに1マス
+  // 歩：その軍から見て前斜め2方向に1マス
   if (piece.name === "歩") {
-    return (
-      sameCoord(diff, rel.forwardLeft) ||
-      sameCoord(diff, rel.forwardRight)
-    );
+    return getPawnForwardDirs(piece.side).some((dir) => sameCoord(diff, dir));
   }
 
   // 騎：旧「弓兵」。6方向に2マスジャンプ
@@ -333,31 +343,30 @@ function isLegalPieceMove(
     return DIRS.some((dir) => sameCoord(diff, add({ q: 0, r: 0 }, dir, 2)));
   }
 
-  // 角：旧「騎兵」。斜め4方向に何マスでも
+  // 角：旧「騎兵」。その軍から見て斜め4方向に何マスでも
   if (piece.name === "角") {
     return getDiagonalDirs(piece.side).some(
-      (dir) =>
-        isSameDirection(diff, dir) &&
-        isPathClear(board, from, to, dir)
+      (dir) => isSameDirection(diff, dir) && isPathClear(board, from, to, dir)
     );
   }
 
-  // 飛：横に何マスでも。前後は1マス飛びずつ何マスでも
+  // 飛：その軍から見て横に何マスでも、前後方向は1マス飛びずつ何マスでも
   if (piece.name === "飛") {
-    const horizontalDirs = getHorizontalDirs(piece.side);
-    const frontBackDirs = [rel.forward, rel.back];
+    const sideAxisDirs = getSideAxisDirs(piece.side);
+    const forwardBackDirs = [
+      ...getPawnForwardDirs(piece.side),
+      ...getBackDirs(piece.side),
+    ];
 
     if (
-      horizontalDirs.some(
-        (dir) =>
-          isSameDirection(diff, dir) &&
-          isPathClear(board, from, to, dir)
+      sideAxisDirs.some(
+        (dir) => isSameDirection(diff, dir) && isPathClear(board, from, to, dir)
       )
     ) {
       return true;
     }
 
-    return frontBackDirs.some((dir) => {
+    return forwardBackDirs.some((dir) => {
       const n = stepCount(diff, dir);
       return n >= 2 && n % 2 === 0 && isPathClear(board, from, to, dir, true);
     });
@@ -372,8 +381,10 @@ function shouldPromote(piece: Piece, to: Coord) {
   if (keyOf(to) === CENTER_KEY) return true;
 
   if (piece.side === "red" && to.r <= -2) return true;
-  if (piece.side === "blue" && to.q >= 2) return true;
-  if (piece.side === "green" && to.q <= -2) return true;
+  if (piece.side === "blue" && to.q <= -2) return true;
+
+  const s = -to.q - to.r;
+  if (piece.side === "green" && s <= -2) return true;
 
   return false;
 }
@@ -407,11 +418,7 @@ function isSideInCheck(board: BoardMap, side: Side, aliveSides: Side[]) {
   return false;
 }
 
-function simulateMove(
-  board: BoardMap,
-  from: Coord,
-  to: Coord
-): BoardMap {
+function simulateMove(board: BoardMap, from: Coord, to: Coord) {
   const next = cloneBoard(board);
   const moving = next[keyOf(from)];
   if (!moving) return next;
@@ -433,21 +440,15 @@ function isLegalMoveConsideringCheck(
 ) {
   if (!isLegalPieceMove(board, piece, from, to)) return false;
 
-  const next = simulateMove(board, from, to);
-
-  // 王が中央に入る手は勝利なので許可
   if (piece.name === "王" && keyOf(to) === CENTER_KEY) {
     return true;
   }
 
+  const next = simulateMove(board, from, to);
   return !isSideInCheck(next, piece.side, aliveSides);
 }
 
-function getLegalDestinations(
-  board: BoardMap,
-  from: Coord,
-  aliveSides: Side[]
-) {
+function getLegalDestinations(board: BoardMap, from: Coord, aliveSides: Side[]) {
   const piece = board[keyOf(from)];
   if (!piece) return [];
 
@@ -461,8 +462,9 @@ function hasAnyLegalMove(board: BoardMap, side: Side, aliveSides: Side[]) {
     const p = board[cell.key];
     if (!p || p.side !== side) continue;
 
-    const moves = getLegalDestinations(board, cell, aliveSides);
-    if (moves.length > 0) return true;
+    if (getLegalDestinations(board, cell, aliveSides).length > 0) {
+      return true;
+    }
   }
 
   return false;
@@ -491,14 +493,11 @@ function nextNormalSide(from: Side, aliveSides: Side[]) {
   return from;
 }
 
-function firstCheckedSideBy(
-  board: BoardMap,
-  attacker: Side,
-  aliveSides: Side[]
-): Side | null {
+function firstCheckedSideBy(board: BoardMap, attacker: Side, aliveSides: Side[]) {
   for (const side of SIDES) {
     if (side === attacker) continue;
     if (!aliveSides.includes(side)) continue;
+
     if (isSideInCheck(board, side, aliveSides)) {
       return side;
     }
@@ -508,23 +507,19 @@ function firstCheckedSideBy(
 }
 
 function getCellPixel(c: Coord) {
-  const size = 34;
+  const size = 36;
   const x = size * Math.sqrt(3) * (c.q + c.r / 2);
   const y = size * 1.5 * c.r;
 
   return {
-    x: x + 310,
-    y: y + 310,
+    x: x + 330,
+    y: y + 330,
   };
 }
 
 function getMoveMarkForPiece(piece: Piece) {
-  if (piece.name === "歩") return "●";
-  if (piece.name === "と") return "●";
-  if (piece.name === "騎") return "●";
   if (piece.name === "角") return "↗";
   if (piece.name === "飛") return "➜";
-  if (piece.name === "王") return "●";
   return "●";
 }
 
@@ -811,13 +806,15 @@ export default function ThreeShogiApp() {
           };
         }
 
+        const turnAfterMate = nextNormalSide(checkedSide, aliveAfterMate);
+
         return {
           board: boardAfterMate,
           alive: aliveAfterMate,
-          nextTurn: nextNormalSide(checkedSide, aliveAfterMate),
+          nextTurn: turnAfterMate,
           nextPendingReturnSide: null,
           status: "playing" as GameStatus,
-          extraMessage: `${SIDE_LABEL[checkedSide]}は詰みです。次は${SIDE_LABEL[nextNormalSide(checkedSide, aliveAfterMate)]}の手番です。`,
+          extraMessage: `${SIDE_LABEL[checkedSide]}は詰みです。次は${SIDE_LABEL[turnAfterMate]}の手番です。`,
         };
       }
 
@@ -842,13 +839,15 @@ export default function ThreeShogiApp() {
       };
     }
 
+    const normalNext = nextNormalSide(mover, currentAlive);
+
     return {
       board: nextBoard,
       alive: currentAlive,
-      nextTurn: nextNormalSide(mover, currentAlive),
+      nextTurn: normalNext,
       nextPendingReturnSide: null,
       status: "playing" as GameStatus,
-      extraMessage: `次は${SIDE_LABEL[nextNormalSide(mover, currentAlive)]}の手番です。`,
+      extraMessage: `次は${SIDE_LABEL[normalNext]}の手番です。`,
     };
   }
 
@@ -877,7 +876,7 @@ export default function ThreeShogiApp() {
         }
       } else if (piece.side !== currentTurn) {
         setMessage(
-          `テスト自由移動中ですが、手番は${SIDE_LABEL[currentTurn]}です。手番の駒を選んでください。`
+          `一人テスト中ですが、手番は${SIDE_LABEL[currentTurn]}です。手番の駒を選んでください。`
         );
         return;
       }
@@ -901,13 +900,7 @@ export default function ThreeShogiApp() {
     }
 
     if (
-      !isLegalMoveConsideringCheck(
-        board,
-        fromPiece,
-        selected,
-        cell,
-        aliveSides
-      )
+      !isLegalMoveConsideringCheck(board, fromPiece, selected, cell, aliveSides)
     ) {
       setMessage("その動きはできません。駒の動き、または王手の状態を確認してください。");
       return;
@@ -1001,7 +994,7 @@ export default function ThreeShogiApp() {
     });
   }
 
-  const boardSize = 660;
+  const boardSize = 700;
 
   return (
     <div style={pageStyle}>
@@ -1093,6 +1086,15 @@ export default function ThreeShogiApp() {
           </button>
 
           <div style={ruleBoxStyle}>
+            <b>陣地</b>
+            <br />
+            左上：緑軍
+            <br />
+            右上：青軍
+            <br />
+            下：赤軍
+            <br />
+            <br />
             <b>勝利条件</b>
             <br />
             ・敵の王を取る
@@ -1156,7 +1158,7 @@ export default function ThreeShogiApp() {
                   {piece ? (
                     <>
                       <span style={{ color: SIDE_COLOR[piece.side], fontSize: 11 }}>
-                        {SIDE_LABEL[piece.side].slice(0, 1)}
+                        {SIDE_SHORT[piece.side]}
                       </span>
                       <span>{piece.name}</span>
                     </>
@@ -1202,15 +1204,15 @@ export default function ThreeShogiApp() {
 
           <h2 style={h2Style}>駒の動き</h2>
           <div style={ruleBoxStyle}>
-            歩：前斜め1マス
+            歩：自軍から見て前斜め1マス
             <br />
             と：6方向1マス
             <br />
             騎：6方向に2マスジャンプ
             <br />
-            角：斜め4方向に何マスでも
+            角：自軍から見て斜め4方向に何マスでも
             <br />
-            飛：横に何マスでも、前後は1マス飛び
+            飛：自軍から見て横に何マスでも、前後は1マス飛び
             <br />
             王：6方向1マス
           </div>
@@ -1279,7 +1281,7 @@ const headerStyle: CSSProperties = {
 
 const mainGridStyle: CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "260px minmax(680px, 1fr) 310px",
+  gridTemplateColumns: "260px minmax(720px, 1fr) 310px",
   gap: 16,
   alignItems: "start",
   overflowX: "auto",
