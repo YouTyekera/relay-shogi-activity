@@ -24,9 +24,6 @@ type Participant = {
   id: string;
   username?: string;
   global_name?: string;
-  avatar?: string | null;
-  avatarUrl?: string | null;
-  avatar_url?: string | null;
 };
 
 type Teams = Record<Side, Participant[]>;
@@ -59,6 +56,8 @@ type SyncState = {
   pendingReturnSide: Side | null;
   selectedHand: { side: Side; name: DroppablePieceName } | null;
   lastMove: LastMove | null;
+  reviewMode: boolean;
+  reviewIndex: number;
 };
 
 const SIDES: Side[] = ["red", "blue", "green"];
@@ -81,6 +80,7 @@ const SIDE_COLOR: Record<Side, string> = {
   green: "#7ee787",
 };
 
+// 六角方向
 const DIRS: Coord[] = [
   { q: 1, r: 0 },
   { q: 1, r: -1 },
@@ -129,11 +129,7 @@ function createEmptyBoard(): BoardMap {
 }
 
 function createEmptyHands(): Hands {
-  return {
-    red: {},
-    blue: {},
-    green: {},
-  };
+  return { red: {}, blue: {}, green: {} };
 }
 
 function cloneBoard(board: BoardMap): BoardMap {
@@ -156,28 +152,6 @@ function cloneHands(hands: Hands): Hands {
 function put(board: BoardMap, q: number, r: number, piece: Piece) {
   const key = keyOf({ q, r });
   if (CELL_SET.has(key)) board[key] = piece;
-}
-
-function demoteCapturedPiece(name: PieceName): DroppablePieceName | null {
-  if (name === "王") return null;
-  if (name === "と") return "歩";
-  return name;
-}
-
-function addHand(hands: Hands, side: Side, captured: PieceName): Hands {
-  const handName = demoteCapturedPiece(captured);
-  const next = cloneHands(hands);
-  if (!handName) return next;
-  next[side][handName] = (next[side][handName] ?? 0) + 1;
-  return next;
-}
-
-function removeHand(hands: Hands, side: Side, name: DroppablePieceName): Hands {
-  const next = cloneHands(hands);
-  const current = next[side][name] ?? 0;
-  if (current <= 1) delete next[side][name];
-  else next[side][name] = current - 1;
-  return next;
 }
 
 function createInitialBoard(): BoardMap {
@@ -233,6 +207,28 @@ function getDisplayName(user: Participant | null | undefined) {
   return user.global_name || user.username || `user-${user.id}`;
 }
 
+function demoteCapturedPiece(name: PieceName): DroppablePieceName | null {
+  if (name === "王") return null;
+  if (name === "と") return "歩";
+  return name;
+}
+
+function addHand(hands: Hands, side: Side, captured: PieceName): Hands {
+  const handName = demoteCapturedPiece(captured);
+  const next = cloneHands(hands);
+  if (!handName) return next;
+  next[side][handName] = (next[side][handName] ?? 0) + 1;
+  return next;
+}
+
+function removeHand(hands: Hands, side: Side, name: DroppablePieceName): Hands {
+  const next = cloneHands(hands);
+  const current = next[side][name] ?? 0;
+  if (current <= 1) delete next[side][name];
+  else next[side][name] = current - 1;
+  return next;
+}
+
 function getSideAxisDirs(side: Side) {
   if (side === "red") return [DIRS[0], DIRS[3]];
   if (side === "blue") return [DIRS[2], DIRS[5]];
@@ -245,11 +241,12 @@ function getPawnForwardDirs(side: Side) {
   return [DIRS[0], DIRS[5]];
 }
 
-function getStraightForwardBackDirs(side: Side) {
-  // 飛の真正面・真後ろ
-  if (side === "red") return [DIRS[2], DIRS[5]];
-  if (side === "blue") return [DIRS[3], DIRS[0]];
-  return [DIRS[5], DIRS[2]];
+function getRookForwardJumpDirs(side: Side) {
+  // 飛の「真正面・真後ろ」。
+  // 赤軍の例：-1,4 → 0,2 → 1,0 → 2,-2
+  if (side === "red") return [{ q: 1, r: -2 }, { q: -1, r: 2 }];
+  if (side === "blue") return [{ q: -2, r: 1 }, { q: 2, r: -1 }];
+  return [{ q: 1, r: 1 }, { q: -1, r: -1 }];
 }
 
 function getDiagonalDirs(side: Side) {
@@ -296,18 +293,11 @@ function stepCount(diff: Coord, dir: Coord) {
   return 0;
 }
 
-function isPathClear(
-  board: BoardMap,
-  from: Coord,
-  to: Coord,
-  dir: Coord,
-  jumpEveryOther = false
-) {
+function isPathClear(board: BoardMap, from: Coord, to: Coord, dir: Coord) {
   const n = stepCount(coordDiff(from, to), dir);
   if (n <= 1) return true;
 
   for (let i = 1; i < n; i++) {
-    if (jumpEveryOther && i % 2 === 1) continue;
     const mid = add(from, dir, i);
     if (board[keyOf(mid)]) return false;
   }
@@ -315,12 +305,7 @@ function isPathClear(
   return true;
 }
 
-function isLegalPieceMove(
-  board: BoardMap,
-  piece: Piece,
-  from: Coord,
-  to: Coord
-) {
+function isLegalPieceMove(board: BoardMap, piece: Piece, from: Coord, to: Coord) {
   if (!isInside(to)) return false;
   if (sameCoord(from, to)) return false;
 
@@ -349,7 +334,7 @@ function isLegalPieceMove(
 
   if (piece.name === "飛") {
     const sideAxisDirs = getSideAxisDirs(piece.side);
-    const forwardBackDirs = getStraightForwardBackDirs(piece.side);
+    const forwardJumpDirs = getRookForwardJumpDirs(piece.side);
 
     if (
       sideAxisDirs.some(
@@ -359,9 +344,9 @@ function isLegalPieceMove(
       return true;
     }
 
-    return forwardBackDirs.some((dir) => {
+    return forwardJumpDirs.some((dir) => {
       const n = stepCount(diff, dir);
-      return n >= 2 && n % 2 === 0 && isPathClear(board, from, to, dir, true);
+      return n >= 1 && isPathClear(board, from, to, dir);
     });
   }
 
@@ -425,9 +410,10 @@ function isLegalMoveConsideringCheck(
   aliveSides: Side[]
 ) {
   if (!isLegalPieceMove(board, piece, from, to)) return false;
-  if (piece.name === "王" && keyOf(to) === CENTER_KEY) return true;
 
   const next = simulateMove(board, from, to);
+
+  // 中央勝利も、敵駒の効きがある場合は不可。
   return !isSideInCheck(next, piece.side, aliveSides);
 }
 
@@ -522,9 +508,39 @@ function getMoveMarkForPiece(piece: Piece | null) {
   return "●";
 }
 
+function playTone(type: "move" | "capture" | "check" | "drop" | "win") {
+  try {
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    const ctx = new AudioContextClass();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+
+    const freq = {
+      move: 440,
+      capture: 180,
+      check: 880,
+      drop: 520,
+      win: 660,
+    }[type];
+
+    osc.frequency.value = freq;
+    osc.type = type === "check" ? "square" : "sine";
+    gain.gain.value = 0.06;
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.start();
+    osc.stop(ctx.currentTime + 0.12);
+  } catch {
+    // 音が出なくてもゲーム進行は止めない
+  }
+}
+
 export default function ThreeShogiApp() {
   const socketRef = useRef<Socket | null>(null);
   const roomIdRef = useRef("local-three-shogi-room");
+  const bgmRef = useRef<HTMLAudioElement | null>(null);
 
   const [status, setStatus] = useState("起動中...");
   const [socketStatus, setSocketStatus] = useState("Socket未接続");
@@ -545,8 +561,18 @@ export default function ThreeShogiApp() {
   const [pendingReturnSide, setPendingReturnSide] = useState<Side | null>(null);
   const [freeMoveMode, setFreeMoveMode] = useState(true);
   const [lastMove, setLastMove] = useState<LastMove | null>(null);
+  const [reviewMode, setReviewMode] = useState(false);
+  const [reviewIndex, setReviewIndex] = useState(0);
 
   const isHost = !!currentUser && currentUser.id === hostId;
+
+  const displayBoard = reviewMode && reviewIndex > 0
+    ? moveHistory[reviewIndex - 1]?.board ?? board
+    : board;
+
+  const displayHands = reviewMode && reviewIndex > 0
+    ? moveHistory[reviewIndex - 1]?.hands ?? hands
+    : hands;
 
   const mySide = useMemo(() => {
     if (!currentUser) return null;
@@ -554,15 +580,39 @@ export default function ThreeShogiApp() {
   }, [currentUser, teams]);
 
   const legalDestinations = useMemo(() => {
+    if (reviewMode) return [];
     if (selected) return getLegalDestinations(board, selected, aliveSides);
     if (selectedHand) return getLegalDropDestinations(board, selectedHand.side, selectedHand.name, aliveSides);
     return [];
-  }, [selected, selectedHand, board, aliveSides]);
+  }, [selected, selectedHand, board, aliveSides, reviewMode]);
 
   const legalDestinationKeys = useMemo(
     () => new Set(legalDestinations.map((c) => c.key)),
     [legalDestinations]
   );
+
+  useEffect(() => {
+    const audio = bgmRef.current;
+    if (!audio) return;
+
+    let src = "/bgm/main.mp3";
+    if (reviewMode || gameStatus === "finished") src = "/bgm/review.mp3";
+    else if (moveNumber >= 50) src = "/bgm/calm.mp3";
+
+    if (!audio.src.endsWith(src)) {
+      audio.src = src;
+      audio.loop = true;
+      audio.volume = 0.18;
+      audio.play().catch(() => {});
+    }
+  }, [moveNumber, gameStatus, reviewMode]);
+
+  function ensureBgmPlaying() {
+    const audio = bgmRef.current;
+    if (!audio) return;
+    audio.volume = 0.18;
+    audio.play().catch(() => {});
+  }
 
   function emitSync(next: Partial<SyncState>) {
     const state: SyncState = {
@@ -579,6 +629,8 @@ export default function ThreeShogiApp() {
       pendingReturnSide,
       selectedHand,
       lastMove,
+      reviewMode,
+      reviewIndex,
       ...next,
     };
 
@@ -618,6 +670,8 @@ export default function ThreeShogiApp() {
       setPendingReturnSide(state.pendingReturnSide ?? null);
       setSelectedHand(state.selectedHand ?? null);
       setLastMove(state.lastMove ?? null);
+      setReviewMode(state.reviewMode ?? false);
+      setReviewIndex(state.reviewIndex ?? 0);
       setSelected(null);
     });
 
@@ -627,7 +681,6 @@ export default function ThreeShogiApp() {
         setCurrentUser(localUser);
         setHostId(localUser.id);
         setStatus("ローカル起動中");
-
         socket.emit("register-user", {
           roomId: roomIdRef.current,
           userId: localUser.id,
@@ -679,11 +732,9 @@ export default function ThreeShogiApp() {
     if (!currentUser || gameStatus !== "lobby") return;
 
     const nextTeams: Teams = { red: [], blue: [], green: [] };
-
     for (const s of SIDES) {
       nextTeams[s] = teams[s].filter((u) => u.id !== currentUser.id);
     }
-
     nextTeams[side] = [...nextTeams[side], currentUser];
 
     const nextMessage = `${getDisplayName(currentUser)} が${SIDE_LABEL[side]}に参加しました。`;
@@ -725,6 +776,8 @@ export default function ThreeShogiApp() {
     setAliveSides(SIDES);
     setPendingReturnSide(null);
     setLastMove(null);
+    setReviewMode(false);
+    setReviewIndex(0);
     setMessage("盤面を初期化しました。");
 
     emitSync({
@@ -738,12 +791,16 @@ export default function ThreeShogiApp() {
       pendingReturnSide: null,
       selectedHand: null,
       lastMove: null,
+      reviewMode: false,
+      reviewIndex: 0,
       message: "盤面を初期化しました。",
     });
   }
 
   function startGame() {
     if (!isHost) return;
+
+    ensureBgmPlaying();
 
     const joinedSides = SIDES.filter((s) => teams[s].length > 0);
     if (joinedSides.length < 3 && !freeMoveMode) {
@@ -765,6 +822,8 @@ export default function ThreeShogiApp() {
     setAliveSides(SIDES);
     setPendingReturnSide(null);
     setLastMove(null);
+    setReviewMode(false);
+    setReviewIndex(0);
     setMessage("対局開始。赤軍の手番です。");
 
     emitSync({
@@ -778,7 +837,23 @@ export default function ThreeShogiApp() {
       pendingReturnSide: null,
       selectedHand: null,
       lastMove: null,
+      reviewMode: false,
+      reviewIndex: 0,
       message: "対局開始。赤軍の手番です。",
+    });
+  }
+
+  function setReview(nextMode: boolean, nextIndex: number) {
+    const fixedIndex = Math.max(0, Math.min(nextIndex, moveHistory.length));
+    setReviewMode(nextMode);
+    setReviewIndex(fixedIndex);
+
+    emitSync({
+      reviewMode: nextMode,
+      reviewIndex: fixedIndex,
+      message: nextMode
+        ? `感想戦中：${fixedIndex}手目を表示しています。`
+        : "感想戦を終了しました。",
     });
   }
 
@@ -803,6 +878,7 @@ export default function ThreeShogiApp() {
             nextTurn: aliveAfterMate[0],
             nextPendingReturnSide: null,
             status: "finished" as GameStatus,
+            sound: "win" as const,
             extraMessage: `${SIDE_LABEL[checkedSide]}は詰みです。${SIDE_LABEL[aliveAfterMate[0]]}の勝利です。`,
           };
         }
@@ -814,6 +890,7 @@ export default function ThreeShogiApp() {
           nextTurn: turnAfterMate,
           nextPendingReturnSide: null,
           status: "playing" as GameStatus,
+          sound: "capture" as const,
           extraMessage: `${SIDE_LABEL[checkedSide]}は詰みです。次は${SIDE_LABEL[turnAfterMate]}の手番です。`,
         };
       }
@@ -824,6 +901,7 @@ export default function ThreeShogiApp() {
         nextTurn: checkedSide,
         nextPendingReturnSide: mover,
         status: "playing" as GameStatus,
+        sound: "check" as const,
         extraMessage: `王手！すぐに${SIDE_LABEL[checkedSide]}の手番です。対応後、王手を返さなければ${SIDE_LABEL[mover]}に手番が戻ります。`,
       };
     }
@@ -835,6 +913,7 @@ export default function ThreeShogiApp() {
         nextTurn: currentPendingReturnSide,
         nextPendingReturnSide: null,
         status: "playing" as GameStatus,
+        sound: "move" as const,
         extraMessage: `${SIDE_LABEL[currentPendingReturnSide]}に手番が戻ります。`,
       };
     }
@@ -846,6 +925,7 @@ export default function ThreeShogiApp() {
       nextTurn: normalNext,
       nextPendingReturnSide: null,
       status: "playing" as GameStatus,
+      sound: "move" as const,
       extraMessage: `次は${SIDE_LABEL[normalNext]}の手番です。`,
     };
   }
@@ -857,6 +937,7 @@ export default function ThreeShogiApp() {
   }
 
   function selectHandPiece(side: Side, name: DroppablePieceName) {
+    if (reviewMode) return;
     if (gameStatus !== "playing") return;
     if (!canOperateSide(side)) {
       setMessage(`今は${SIDE_LABEL[currentTurn]}の手番です。`);
@@ -870,7 +951,10 @@ export default function ThreeShogiApp() {
   }
 
   function onCellClick(cell: Cell) {
+    if (reviewMode) return;
     if (gameStatus !== "playing") return;
+
+    ensureBgmPlaying();
 
     const piece = board[cell.key];
 
@@ -915,6 +999,8 @@ export default function ThreeShogiApp() {
       const nextMessage = `${moveText}。${decision.extraMessage}`;
       const nextLastMove: LastMove = { to: cell.key };
 
+      playTone(decision.sound === "move" ? "drop" : decision.sound);
+
       setBoard(nextBoard);
       setHands(nextHands);
       setSelected(null);
@@ -926,6 +1012,7 @@ export default function ThreeShogiApp() {
       setPendingReturnSide(decision.nextPendingReturnSide);
       setGameStatus(decision.status);
       setLastMove(nextLastMove);
+      setReviewIndex(nextHistory.length);
       setMessage(nextMessage);
 
       emitSync({
@@ -939,6 +1026,7 @@ export default function ThreeShogiApp() {
         gameStatus: decision.status,
         selectedHand: null,
         lastMove: nextLastMove,
+        reviewIndex: nextHistory.length,
         message: nextMessage,
       });
       return;
@@ -971,7 +1059,7 @@ export default function ThreeShogiApp() {
     }
 
     if (!isLegalMoveConsideringCheck(board, fromPiece, selected, cell, aliveSides)) {
-      setMessage("その動きはできません。駒の動き、または王手の状態を確認してください。");
+      setMessage("その動きはできません。王が中央に入る場合も、敵駒の効きがある中央には入れません。");
       return;
     }
 
@@ -992,10 +1080,12 @@ export default function ThreeShogiApp() {
     let nextTurn = currentTurn;
     let nextPendingReturnSide: Side | null = pendingReturnSide;
     let resultText = "";
+    let sound: "move" | "capture" | "check" | "drop" | "win" = captured ? "capture" : "move";
 
     if (movedPiece.name === "王" && cell.key === CENTER_KEY) {
       nextGameStatus = "finished";
       resultText = `${SIDE_LABEL[fromPiece.side]}の王が中央マスに入りました。${SIDE_LABEL[fromPiece.side]}の勝利です。`;
+      sound = "win";
     } else if (captured?.name === "王") {
       nextAliveSides = aliveSides.filter((s) => s !== captured.side);
       nextBoard = removeSidePieces(nextBoard, captured.side);
@@ -1003,10 +1093,12 @@ export default function ThreeShogiApp() {
       if (nextAliveSides.length === 1) {
         nextGameStatus = "finished";
         resultText = `${SIDE_LABEL[captured.side]}の王を取りました。${SIDE_LABEL[nextAliveSides[0]]}の勝利です。`;
+        sound = "win";
       } else {
         nextTurn = nextNormalSide(captured.side, nextAliveSides);
         nextPendingReturnSide = null;
         resultText = `${SIDE_LABEL[captured.side]}は脱落しました。次は${SIDE_LABEL[nextTurn]}の手番です。`;
+        sound = "capture";
       }
     } else {
       const decision = decideNextTurnAfterMove(
@@ -1023,6 +1115,7 @@ export default function ThreeShogiApp() {
       nextPendingReturnSide = decision.nextPendingReturnSide;
       nextGameStatus = decision.status;
       resultText = decision.extraMessage;
+      sound = captured ? "capture" : decision.sound;
     }
 
     const nextMoveNumber = moveNumber + 1;
@@ -1043,6 +1136,8 @@ export default function ThreeShogiApp() {
     const nextMessage = `${moveText}。${resultText}`;
     const nextLastMove: LastMove = { from: keyOf(selected), to: cell.key };
 
+    playTone(sound);
+
     setBoard(nextBoard);
     setHands(nextHands);
     setSelected(null);
@@ -1054,6 +1149,7 @@ export default function ThreeShogiApp() {
     setPendingReturnSide(nextPendingReturnSide);
     setGameStatus(nextGameStatus);
     setLastMove(nextLastMove);
+    setReviewIndex(nextHistory.length);
     setMessage(nextMessage);
 
     emitSync({
@@ -1067,6 +1163,7 @@ export default function ThreeShogiApp() {
       gameStatus: nextGameStatus,
       selectedHand: null,
       lastMove: nextLastMove,
+      reviewIndex: nextHistory.length,
       message: nextMessage,
     });
   }
@@ -1075,6 +1172,8 @@ export default function ThreeShogiApp() {
 
   return (
     <div style={pageStyle}>
+      <audio ref={bgmRef} src="/bgm/main.mp3" loop />
+
       <header style={headerStyle}>
         <div>
           <h1 style={{ margin: 0 }}>三人将棋 ベータ版</h1>
@@ -1086,6 +1185,9 @@ export default function ThreeShogiApp() {
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           {isHost && <button onClick={startGame} style={buttonStyle("#238636")}>対局開始</button>}
           {isHost && <button onClick={resetGame} style={buttonStyle("#30363d")}>初期化</button>}
+          <button onClick={() => setReview(!reviewMode, reviewMode ? moveHistory.length : reviewIndex)} style={buttonStyle("#8250df")}>
+            {reviewMode ? "感想戦終了" : "感想戦"}
+          </button>
           <label style={checkStyle}>
             <input type="checkbox" checked={freeMoveMode} onChange={(e) => setFreeMoveMode(e.target.checked)} />
             一人テスト
@@ -1132,12 +1234,12 @@ export default function ThreeShogiApp() {
                   <b>持ち駒</b>
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 }}>
                     {HAND_PIECES.map((name) => {
-                      const count = hands[side][name] ?? 0;
+                      const count = displayHands[side][name] ?? 0;
                       const active = selectedHand?.side === side && selectedHand.name === name;
                       return (
                         <button
                           key={name}
-                          disabled={count <= 0 || gameStatus !== "playing"}
+                          disabled={count <= 0 || gameStatus !== "playing" || reviewMode}
                           onClick={() => selectHandPiece(side, name)}
                           style={{
                             ...handButtonStyle,
@@ -1168,12 +1270,12 @@ export default function ThreeShogiApp() {
           <div style={{ position: "relative", width: boardSize, height: boardSize }}>
             {CELLS.map((cell) => {
               const p = getCellPixel(cell);
-              const piece = board[cell.key];
+              const piece = displayBoard[cell.key];
               const isSelected = selected && selected.q === cell.q && selected.r === cell.r;
               const isLegalDestination = legalDestinationKeys.has(cell.key);
               const isCenter = cell.key === CENTER_KEY;
-              const isLastFrom = lastMove?.from === cell.key;
-              const isLastTo = lastMove?.to === cell.key;
+              const isLastFrom = !reviewMode && lastMove?.from === cell.key;
+              const isLastTo = !reviewMode && lastMove?.to === cell.key;
 
               return (
                 <button
@@ -1208,7 +1310,7 @@ export default function ThreeShogiApp() {
                       ? "#3a2410"
                       : "#161b22",
                     color: piece ? "#0d1117" : "#8b949e",
-                    cursor: "pointer",
+                    cursor: reviewMode ? "default" : "pointer",
                     fontWeight: 900,
                     fontSize: 20,
                     display: "flex",
@@ -1249,6 +1351,19 @@ export default function ThreeShogiApp() {
             手番: <b style={{ color: SIDE_COLOR[currentTurn] }}>{SIDE_LABEL[currentTurn]}</b>
           </div>
 
+          {reviewMode && (
+            <div style={reviewBoxStyle}>
+              <b>感想戦中</b>
+              <div>{reviewIndex} / {moveHistory.length} 手目</div>
+              <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                <button onClick={() => setReview(true, reviewIndex - 1)} style={smallButtonStyle}>前</button>
+                <button onClick={() => setReview(true, reviewIndex + 1)} style={smallButtonStyle}>次</button>
+                <button onClick={() => setReview(true, 0)} style={smallButtonStyle}>初期</button>
+                <button onClick={() => setReview(true, moveHistory.length)} style={smallButtonStyle}>最新</button>
+              </div>
+            </div>
+          )}
+
           {pendingReturnSide && (
             <div style={{ marginBottom: 8, color: "#f2cc60" }}>
               王手対応後、王手を返さなければ{SIDE_LABEL[pendingReturnSide]}へ戻ります。
@@ -1263,7 +1378,7 @@ export default function ThreeShogiApp() {
             と：6方向1マス<br />
             騎：6方向に2マスジャンプ<br />
             角：自軍から見て斜め4方向に何マスでも<br />
-            飛：自軍から見て横に何マスでも、真正面・真後ろは1マス飛び<br />
+            飛：横に何マスでも、真正面・真後ろは一マス飛びずつ<br />
             王：6方向1マス
           </div>
 
@@ -1373,6 +1488,24 @@ const handButtonStyle: CSSProperties = {
   color: "#f0f6fc",
   borderRadius: 6,
   padding: "4px 6px",
+  cursor: "pointer",
+};
+
+const reviewBoxStyle: CSSProperties = {
+  padding: 10,
+  borderRadius: 10,
+  background: "#1f1336",
+  border: "1px solid #8250df",
+  marginBottom: 12,
+  fontSize: 13,
+};
+
+const smallButtonStyle: CSSProperties = {
+  background: "#30363d",
+  color: "#f0f6fc",
+  border: "none",
+  borderRadius: 6,
+  padding: "4px 8px",
   cursor: "pointer",
 };
 
