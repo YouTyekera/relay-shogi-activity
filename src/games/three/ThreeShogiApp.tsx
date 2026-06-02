@@ -410,7 +410,7 @@ export default function ThreeShogiApp() {
       setSocketStatus("Socketエラー");
     });
 
-    socket.on("room-users", (ids: string[]) => {
+    socket.on("room-users", () => {
     });
 
     socket.on("game-state", (state: SyncState) => {
