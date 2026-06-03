@@ -547,14 +547,6 @@ function deactivateSidePieces(board: BoardMap, side: Side) {
   return next;
 }
 
-function removeSidePieces(board: BoardMap, side: Side) {
-  const next = cloneBoard(board);
-  for (const key of Object.keys(next)) {
-    if (next[key]?.side === side) next[key] = null;
-  }
-  return next;
-}
-
 function nextNormalSide(from: Side, aliveSides: Side[]) {
   const start = SIDES.indexOf(from);
   for (let i = 1; i <= SIDES.length; i++) {
