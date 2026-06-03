@@ -357,7 +357,11 @@ function isLegalPieceMove(board: BoardMap, piece: Piece, from: Coord, to: Coord)
   if (sameCoord(from, to)) return false;
 
   const target = board[keyOf(to)];
+
   if (target?.side === piece.side) return false;
+
+  // 脱落済みの王は取れない。障害物として残る。
+  if (target?.inactive && target.name === "王") return false;
 
   const diff = coordDiff(from, to);
   const distance = hexDistance(from, to);
@@ -556,6 +560,27 @@ function nextNormalSide(from: Side, aliveSides: Side[]) {
   return from;
 }
 
+function nextSideAfterElimination(
+  mover: Side,
+  eliminated: Side,
+  aliveAfterElimination: Side[]
+) {
+  const candidates = aliveAfterElimination.filter((side) => side !== mover);
+
+  if (candidates.length > 0) {
+    const start = SIDES.indexOf(eliminated);
+
+    for (let i = 1; i <= SIDES.length; i++) {
+      const candidate = SIDES[(start + i) % SIDES.length];
+      if (candidates.includes(candidate)) return candidate;
+    }
+
+    return candidates[0];
+  }
+
+  return mover;
+}
+
 function firstCheckedSideBy(board: BoardMap, attacker: Side, aliveSides: Side[]) {
   for (const side of SIDES) {
     if (side === attacker) continue;
@@ -574,6 +599,15 @@ function getCellPixel(c: Coord, boardSize: number) {
     x: x + boardSize / 2,
     y: y + boardSize / 2,
   };
+}
+
+function getPixelForLogicalCoord(
+  c: Coord,
+  viewerSide: Side | null,
+  boardSize: number
+) {
+  const visual = rotateCoordForViewer(c, viewerSide);
+  return getCellPixel(visual, boardSize);
 }
 
 function getMoveMarkForPiece(piece: Piece | null) {
@@ -1021,7 +1055,11 @@ export default function ThreeShogiApp() {
           };
         }
 
-        const turnAfterMate = nextNormalSide(checkedSide, aliveAfterMate);
+        const turnAfterMate = nextSideAfterElimination(
+          mover,
+          checkedSide,
+          aliveAfterMate
+        );
         return {
           board: boardAfterMate,
           alive: aliveAfterMate,
@@ -1453,6 +1491,38 @@ export default function ThreeShogiApp() {
 
         <main ref={boardWrapRef} style={boardPanelStyle}>
           <div style={{ position: "relative", width: boardSize, height: boardSize }}>
+            <svg
+              width={boardSize}
+              height={boardSize}
+              style={{
+                position: "absolute",
+                inset: 0,
+                pointerEvents: "none",
+                zIndex: 1,
+              }}
+            >
+              {[
+                [{ q: -4, r: 0 }, { q: 4, r: 0 }],
+                [{ q: 0, r: -4 }, { q: 0, r: 4 }],
+              ].map(([a, b], index) => {
+                const p1 = getPixelForLogicalCoord(a, viewerSide, boardSize);
+                const p2 = getPixelForLogicalCoord(b, viewerSide, boardSize);
+
+                return (
+                  <line
+                    key={index}
+                    x1={p1.x}
+                    y1={p1.y}
+                    x2={p2.x}
+                    y2={p2.y}
+                    stroke={index === 0 ? "#58a6ff" : "#ff7b72"}
+                    strokeWidth="2"
+                    strokeOpacity="0.75"
+                  />
+                );
+              })}
+            </svg>
+
             {CELLS.map((cell) => {
               const visualCell = rotateCoordForViewer(cell, viewerSide);
               const p = getCellPixel(visualCell, boardSize);
@@ -1522,6 +1592,7 @@ export default function ThreeShogiApp() {
                         alignItems: "center",
                         justifyContent: "center",
                         lineHeight: 1,
+                        opacity: piece.inactive ? 0.55 : 1,
                       }}
                     >
                       <span style={{ color: SIDE_COLOR[piece.side], fontSize: 10 }}>
@@ -1616,22 +1687,34 @@ export default function ThreeShogiApp() {
   );
 }
 
-function getPieceRotationDeg(pieceSide: Side, viewerSide: Side | null) {
-  const baseDeg: Record<Side, number> = {
-    red: 0,
-    blue: 120,
-    green: -120,
-  };
-
-  const viewerDeg: Record<Side, number> = {
-    red: 0,
-    blue: 120,
-    green: -120,
-  };
-
-  return baseDeg[pieceSide] - viewerDeg[viewerSide ?? "red"];
+function getFacingVector(side: Side): Coord {
+  // 各陣営から見て中央へ向かう方向
+  if (side === "red") return { q: 1, r: -2 };
+  if (side === "blue") return { q: -2, r: 1 };
+  return { q: 1, r: 1 };
 }
 
+function axialToPixelVector(v: Coord) {
+  return {
+    x: Math.sqrt(3) * (v.q + v.r / 2),
+    y: 1.5 * v.r,
+  };
+}
+
+function getPieceRotationDeg(pieceSide: Side, viewerSide: Side | null) {
+  const origin = rotateCoordForViewer({ q: 0, r: 0 }, viewerSide);
+  const front = rotateCoordForViewer(getFacingVector(pieceSide), viewerSide);
+
+  const v = {
+    q: front.q - origin.q,
+    r: front.r - origin.r,
+  };
+
+  const p = axialToPixelVector(v);
+
+  // 文字の上方向を「駒の正面」に向ける
+  return (Math.atan2(p.x, -p.y) * 180) / Math.PI;
+}
 
 function buttonStyle(bg: string, darkText = false): CSSProperties {
   return {
