@@ -16,7 +16,8 @@ type DroppablePieceName = "歩" | "騎" | "角" | "飛";
 
 type Coord = { q: number; r: number };
 type Cell = Coord & { key: string };
-type Piece = { side: Side; name: PieceName; promoted?: boolean };
+type Piece = { side: Side; name: PieceName; promoted?: boolean; inactive?: boolean;
+ };
 type BoardMap = Record<string, Piece | null>;
 type Hands = Record<Side, Partial<Record<DroppablePieceName, number>>>;
 
@@ -351,6 +352,7 @@ function shouldPromote(piece: Piece, to: Coord) {
 }
 
 function isLegalPieceMove(board: BoardMap, piece: Piece, from: Coord, to: Coord) {
+  if (piece.inactive) return false;
   if (!isInside(to)) return false;
   if (sameCoord(from, to)) return false;
 
@@ -454,9 +456,7 @@ function simulateMove(board: BoardMap, from: Coord, to: Coord) {
   if (!moving) return next;
 
   next[keyOf(from)] = null;
-  next[keyOf(to)] = shouldPromote(moving, to)
-    ? { ...moving, name: promotePieceName(moving.name), promoted: true }
-    : moving;
+  next[keyOf(to)] = moving;
 
   return next;
 }
@@ -530,6 +530,21 @@ function hasAnyLegalMove(board: BoardMap, side: Side, aliveSides: Side[], hands:
   }
 
   return false;
+}
+
+function deactivateSidePieces(board: BoardMap, side: Side) {
+  const next = cloneBoard(board);
+
+  for (const key of Object.keys(next)) {
+    if (next[key]?.side === side) {
+      next[key] = {
+        ...next[key]!,
+        inactive: true,
+      };
+    }
+  }
+
+  return next;
 }
 
 function removeSidePieces(board: BoardMap, side: Side) {
@@ -703,7 +718,7 @@ export default function ThreeShogiApp() {
     if (!audio.src.endsWith(src)) {
       audio.src = src;
       audio.loop = true;
-      audio.volume = 0.18;
+      audio.volume = volume;
       audio.play().catch(() => {});
     }
   }, [moveNumber, gameStatus, reviewMode]);
@@ -711,7 +726,7 @@ export default function ThreeShogiApp() {
   function ensureBgmPlaying() {
     const audio = bgmRef.current;
     if (!audio) return;
-    audio.volume = 0.18;
+    audio.volume = volume;
     audio.play().catch(() => {});
   }
 
@@ -995,8 +1010,7 @@ export default function ThreeShogiApp() {
     if (checkedSide) {
       if (!hasAnyLegalMove(nextBoard, checkedSide, currentAlive, nextHands)) {
         const aliveAfterMate = currentAlive.filter((s) => s !== checkedSide);
-        const boardAfterMate = removeSidePieces(nextBoard, checkedSide);
-
+        const boardAfterMate = deactivateSidePieces(nextBoard, checkedSide);
         if (aliveAfterMate.length === 1) {
           return {
             board: boardAfterMate,
@@ -1057,13 +1071,15 @@ export default function ThreeShogiApp() {
   }
 
   function canOperateSide(side: Side) {
+    if (!aliveSides.includes(side)) return false;
     if (freeMoveMode) return side === currentTurn;
     if (!mySide) return false;
     return mySide === currentTurn && side === currentTurn;
   }
 
   function selectHandPiece(side: Side, name: DroppablePieceName) {
-    if (reviewMode || gameStatus !== "playing") return;
+    if (reviewMode) return;
+    if (gameStatus !== "playing") return;
 
     if (!canOperateSide(side)) {
       setMessage(`今は${SIDE_LABEL[currentTurn]}の手番です。`);
@@ -1072,9 +1088,23 @@ export default function ThreeShogiApp() {
 
     if ((hands[side][name] ?? 0) <= 0) return;
 
+    if (selectedHand?.side === side && selectedHand.name === name) {
+      setSelectedHand(null);
+      setMessage("持ち駒の選択を解除しました。");
+      return;
+    }
+
     setSelected(null);
     setSelectedHand({ side, name });
-    setMessage(`${SIDE_LABEL[side]}の持ち駒「${name}」を選択しました。空きマスに打てます。`);
+    setMessage(
+      `${SIDE_LABEL[side]}の持ち駒「${name}」を選択しました。もう一度押すと解除できます。`
+    );
+  }
+
+  function askPromotion(piece: Piece, to: Coord) {
+    if (!shouldPromote(piece, to)) return false;
+
+    return window.confirm(`${piece.name}を成りますか？`);
   }
 
   function onCellClick(cell: Cell) {
@@ -1193,7 +1223,9 @@ export default function ThreeShogiApp() {
       ? addHand(hands, fromPiece.side, captured.name)
       : cloneHands(hands);
 
-    const movedPiece: Piece = shouldPromote(fromPiece, cell)
+    const willPromote = askPromotion(fromPiece, cell);
+
+    const movedPiece: Piece = willPromote
       ? { ...fromPiece, name: promotePieceName(fromPiece.name), promoted: true }
       : fromPiece;
 
@@ -1213,7 +1245,7 @@ export default function ThreeShogiApp() {
       sound = "win";
     } else if (captured?.name === "王") {
       nextAliveSides = aliveSides.filter((s) => s !== captured.side);
-      nextBoard = removeSidePieces(nextBoard, captured.side);
+      nextBoard = deactivateSidePieces(nextBoard, captured.side);
 
       if (nextAliveSides.length === 1) {
         nextGameStatus = "finished";
@@ -1460,7 +1492,9 @@ export default function ThreeShogiApp() {
                       ? "2px solid #8b949e"
                       : "1px solid #30363d",
                     background: piece
-                      ? "#f0e0b6"
+                      ? piece.inactive
+                        ? "#8b7355"
+                        : "#f0e0b6"
                       : isCenter
                       ? "#4b3b10"
                       : isLegalDestination
@@ -1486,7 +1520,12 @@ export default function ThreeShogiApp() {
                   {piece ? (
                     <>
                       <span style={{ color: SIDE_COLOR[piece.side], fontSize: 10 }}>{SIDE_SHORT[piece.side]}</span>
-                      <span>{piece.name}</span>
+                      <span style={{ lineHeight: 1 }}>
+                        {piece.name}
+                        <span style={{ fontSize: 10, marginLeft: 2, opacity: 0.75 }}>
+                          {getFacingArrow(piece.side, viewerSide)}
+                        </span>
+                      </span>
                     </>
                   ) : isLegalDestination ? (
                     <span style={{ color: "#58a6ff", fontSize: 18 }}>
@@ -1543,6 +1582,20 @@ export default function ThreeShogiApp() {
             王：6方向1マス
           </div>
 
+          <h2 style={h2Style}>音量</h2>
+          <div style={ruleBoxStyle}>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.01"
+              value={volume}
+              onChange={(e) => setVolume(Number(e.target.value))}
+              style={{ width: "100%" }}
+            />
+            <div>{Math.round(volume * 100)}%</div>
+          </div>
+
           <h2 style={h2Style}>棋譜</h2>
           <div style={{ maxHeight: 220, overflow: "auto", fontSize: 13, lineHeight: 1.7 }}>
             {moveHistory.length === 0 ? (
@@ -1559,6 +1612,33 @@ export default function ThreeShogiApp() {
       </div>
     </div>
   );
+}
+
+function getFacingVector(side: Side): Coord {
+  if (side === "red") return { q: 1, r: -2 };
+  if (side === "blue") return { q: -2, r: 1 };
+  return { q: 1, r: 1 };
+}
+
+function getArrowFromVector(v: Coord) {
+  const x = Math.sqrt(3) * (v.q + v.r / 2);
+  const y = 1.5 * v.r;
+
+  if (Math.abs(x) > Math.abs(y)) {
+    return x > 0 ? "→" : "←";
+  }
+
+  return y > 0 ? "↓" : "↑";
+}
+
+function getFacingArrow(side: Side, viewer: Side | null) {
+  const origin = rotateCoordForViewer({ q: 0, r: 0 }, viewer);
+  const front = rotateCoordForViewer(getFacingVector(side), viewer);
+
+  return getArrowFromVector({
+    q: front.q - origin.q,
+    r: front.r - origin.r,
+  });
 }
 
 function buttonStyle(bg: string, darkText = false): CSSProperties {
