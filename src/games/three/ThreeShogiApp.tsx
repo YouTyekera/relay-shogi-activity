@@ -1498,7 +1498,7 @@ export default function ThreeShogiApp() {
                 position: "absolute",
                 inset: 0,
                 pointerEvents: "none",
-                zIndex: 1,
+                zIndex: 0,
               }}
             >
               {[
@@ -1545,6 +1545,7 @@ export default function ThreeShogiApp() {
                     top: p.y - cellSize / 2,
                     width: cellSize,
                     height: cellSize,
+                    zIndex: 2,
                     clipPath: "polygon(25% 4%, 75% 4%, 100% 50%, 75% 96%, 25% 96%, 0% 50%)",
                     border: isSelected
                       ? "3px solid #f2cc60"
