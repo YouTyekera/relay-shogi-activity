@@ -1516,8 +1516,8 @@ export default function ThreeShogiApp() {
                     x2={p2.x}
                     y2={p2.y}
                     stroke={index === 0 ? "#58a6ff" : "#ff7b72"}
-                    strokeWidth="2"
-                    strokeOpacity="0.75"
+                    strokeWidth="3"
+                    strokeOpacity="0.5"
                   />
                 );
               })}
