@@ -239,9 +239,18 @@ function removeHand(hands: Hands, side: Side, name: DroppablePieceName): Hands {
 }
 
 function rotateCoordForViewer(c: Coord, viewer: Side | null): Coord {
-  if (viewer === "blue") return { q: -c.r, r: c.q + c.r };
-  if (viewer === "green") return { q: -c.q - c.r, r: c.q };
-  return c;
+  // 赤軍視点：そのまま。赤軍が下。
+  if (viewer === "red" || viewer === null) {
+    return c;
+  }
+
+  // 青軍視点：青軍の陣地が下に来るように120度回転。
+  if (viewer === "blue") {
+    return { q: -c.q - c.r, r: c.q };
+  }
+
+  // 緑軍視点：緑軍の陣地が下に来るように240度回転。
+  return { q: c.r, r: -c.q - c.r };
 }
 
 function getSideAxisDirs(side: Side) {
@@ -641,8 +650,7 @@ export default function ThreeShogiApp() {
   const [reviewMode, setReviewMode] = useState(false);
   const [reviewIndex, setReviewIndex] = useState(0);
 
-  const isHost = !!currentUser && currentUser.id === hostId;
-
+  const isHost = true;
   const mySide = useMemo(() => {
     if (!currentUser) return null;
     return SIDES.find((side) => teams[side].some((u) => u.id === currentUser.id)) ?? null;
@@ -651,8 +659,8 @@ export default function ThreeShogiApp() {
   const viewerSide = mySide ?? currentTurn;
 
   const boardSize = Math.max(
-    420,
-    Math.min(boardWrapSize.width - 16, boardWrapSize.height - 16, 760)
+    480,
+    Math.min(boardWrapSize.width - 8, boardWrapSize.height - 8, 900)
   );
 
   const displayBoard =
@@ -1293,7 +1301,7 @@ export default function ThreeShogiApp() {
 
       <header style={headerStyle}>
         <div>
-          <h1 style={{ margin: 0 }}>三人将棋 ベータ版</h1>
+          <h1 style={{ margin: 0, fontSize: 28, lineHeight: 1.1 }}>三人将棋 ベータ版</h1>
           <div style={{ color: "#8b949e", fontSize: 13 }}>
             {status} / {socketStatus}
           </div>
@@ -1581,7 +1589,7 @@ const headerStyle: CSSProperties = {
   justifyContent: "space-between",
   gap: 12,
   alignItems: "center",
-  marginBottom: 10,
+  marginBottom: 6,
   flexWrap: "wrap",
 };
 
@@ -1593,11 +1601,11 @@ const topButtonRowStyle: CSSProperties = {
 
 const mainGridStyle: CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "minmax(220px, 260px) minmax(360px, 1fr) minmax(240px, 310px)",
-  gap: 12,
+  gridTemplateColumns: "240px minmax(520px, 1fr) 280px",
+  gap: 10,
   alignItems: "stretch",
   width: "100%",
-  height: "calc(100vh - 82px)",
+  height: "calc(100vh - 74px)",
   minHeight: 0,
 };
 
@@ -1618,6 +1626,7 @@ const boardPanelStyle: CSSProperties = {
   minWidth: 0,
   minHeight: 0,
   overflow: "hidden",
+  padding: 6,
 };
 
 const h2Style: CSSProperties = {
