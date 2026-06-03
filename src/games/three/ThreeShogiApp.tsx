@@ -643,7 +643,7 @@ export default function ThreeShogiApp() {
   const roomIdRef = useRef("local-three-shogi-room");
   const bgmRef = useRef<HTMLAudioElement | null>(null);
   const { ref: boardWrapRef, size: boardWrapSize } = useElementSize<HTMLDivElement>();
-
+  const [volume, setVolume] = useState(0.18);
   const [status, setStatus] = useState("起動中...");
   const [socketStatus, setSocketStatus] = useState("Socket未接続");
   const [currentUser, setCurrentUser] = useState<Participant | null>(null);
