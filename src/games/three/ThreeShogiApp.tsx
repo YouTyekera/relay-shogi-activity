@@ -702,10 +702,16 @@ export default function ThreeShogiApp() {
   useEffect(() => {
     const audio = bgmRef.current;
     if (!audio) return;
+    audio.volume = volume;
+  }, [volume]);
+
+  useEffect(() => {
+    const audio = bgmRef.current;
+    if (!audio) return;
 
     let src = "/bgm/main.mp3";
     if (reviewMode || gameStatus === "finished") src = "/bgm/review.mp3";
-    else if (moveNumber >= 50) src = "/bgm/calm.mp3";
+    else if (moveNumber >= 30) src = "/bgm/calm.mp3";
 
     if (!audio.src.endsWith(src)) {
       audio.src = src;
@@ -1093,18 +1099,18 @@ export default function ThreeShogiApp() {
     );
   }
 
-  function askPromotion(piece: Piece, to: Coord) {
-    if (!shouldPromote(piece, to)) return false;
-
-    return window.confirm(`${piece.name}を成りますか？`);
-  }
-
   function onCellClick(cell: Cell) {
     if (reviewMode || gameStatus !== "playing") return;
 
     ensureBgmPlaying();
 
     const piece = board[cell.key];
+    if (selectedHand && piece && canOperateSide(piece.side)) {
+      setSelected(cell);
+      setSelectedHand(null);
+      setMessage(`${SIDE_LABEL[piece.side]}の${piece.name}を選択しました。`);
+      return;
+    }
 
     if (selectedHand) {
       if (!isLegalDrop(board, selectedHand.side, selectedHand.name, cell, aliveSides)) {
@@ -1215,9 +1221,7 @@ export default function ThreeShogiApp() {
       ? addHand(hands, fromPiece.side, captured.name)
       : cloneHands(hands);
 
-    const willPromote = askPromotion(fromPiece, cell);
-
-    const movedPiece: Piece = willPromote
+    const movedPiece: Piece = shouldPromote(fromPiece, cell)
       ? { ...fromPiece, name: promotePieceName(fromPiece.name), promoted: true }
       : fromPiece;
 
@@ -1510,15 +1514,21 @@ export default function ThreeShogiApp() {
                   }}
                 >
                   {piece ? (
-                    <>
-                      <span style={{ color: SIDE_COLOR[piece.side], fontSize: 10 }}>{SIDE_SHORT[piece.side]}</span>
-                      <span style={{ lineHeight: 1 }}>
-                        {piece.name}
-                        <span style={{ fontSize: 10, marginLeft: 2, opacity: 0.75 }}>
-                          {getFacingArrow(piece.side, viewerSide)}
-                        </span>
+                    <div
+                      style={{
+                        transform: `rotate(${getPieceRotationDeg(piece.side, viewerSide)}deg)`,
+                        display: "flex",
+                        flexDirection: "column",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        lineHeight: 1,
+                      }}
+                    >
+                      <span style={{ color: SIDE_COLOR[piece.side], fontSize: 10 }}>
+                        {SIDE_SHORT[piece.side]}
                       </span>
-                    </>
+                      <span>{piece.name}</span>
+                    </div>
                   ) : isLegalDestination ? (
                     <span style={{ color: "#58a6ff", fontSize: 18 }}>
                       {selectedHand ? "打" : getMoveMarkForPiece(selected ? board[keyOf(selected)] : null)}
@@ -1606,32 +1616,22 @@ export default function ThreeShogiApp() {
   );
 }
 
-function getFacingVector(side: Side): Coord {
-  if (side === "red") return { q: 1, r: -2 };
-  if (side === "blue") return { q: -2, r: 1 };
-  return { q: 1, r: 1 };
+function getPieceRotationDeg(pieceSide: Side, viewerSide: Side | null) {
+  const baseDeg: Record<Side, number> = {
+    red: 0,
+    blue: 120,
+    green: -120,
+  };
+
+  const viewerDeg: Record<Side, number> = {
+    red: 0,
+    blue: 120,
+    green: -120,
+  };
+
+  return baseDeg[pieceSide] - viewerDeg[viewerSide ?? "red"];
 }
 
-function getArrowFromVector(v: Coord) {
-  const x = Math.sqrt(3) * (v.q + v.r / 2);
-  const y = 1.5 * v.r;
-
-  if (Math.abs(x) > Math.abs(y)) {
-    return x > 0 ? "→" : "←";
-  }
-
-  return y > 0 ? "↓" : "↑";
-}
-
-function getFacingArrow(side: Side, viewer: Side | null) {
-  const origin = rotateCoordForViewer({ q: 0, r: 0 }, viewer);
-  const front = rotateCoordForViewer(getFacingVector(side), viewer);
-
-  return getArrowFromVector({
-    q: front.q - origin.q,
-    r: front.r - origin.r,
-  });
-}
 
 function buttonStyle(bg: string, darkText = false): CSSProperties {
   return {
