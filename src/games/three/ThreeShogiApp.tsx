@@ -1712,15 +1712,25 @@ export default function ThreeShogiApp() {
               </defs>
 
               {[
+                // q軸：r = 0
                 {
                   a: { q: -4, r: 0 },
                   b: { q: 4, r: 0 },
                   color: "#58a6ff",
                 },
+
+                // r軸：q = 0
                 {
                   a: { q: 0, r: -4 },
                   b: { q: 0, r: 4 },
                   color: "#ff7b72",
+                },
+
+                // s軸：q + r = 0
+                {
+                  a: { q: -4, r: 4 },
+                  b: { q: 4, r: -4 },
+                  color: "#7ee787",
                 },
               ].map((axis, index) => {
                 const p1 = getPixelForLogicalCoord(axis.a, viewerSide, boardSize);
@@ -1735,7 +1745,7 @@ export default function ThreeShogiApp() {
                     y2={p2.y}
                     stroke={axis.color}
                     strokeWidth="2.5"
-                    strokeOpacity="0.75"
+                    strokeOpacity="0.55"
                     mask="url(#axis-mask)"
                   />
                 );
