@@ -647,37 +647,29 @@ function getPieceRotationDeg(pieceSide: Side, viewerSide: Side | null) {
   return (Math.atan2(p.x, -p.y) * 180) / Math.PI;
 }
 
-function isAxisCell(cell: Cell) {
-  return cell.q === 0 || cell.r === 0;
+function getPixelForLogicalCoord(
+  c: Coord,
+  viewerSide: Side | null,
+  boardSize: number
+) {
+  const visual = rotateCoordForViewer(c, viewerSide);
+  return getCellPixel(visual, boardSize);
 }
 
-function getAxisLineStyle(cell: Cell): CSSProperties | null {
-  if (cell.q === 0 && cell.r === 0) return null;
+function getHexPolygonPoints(cx: number, cy: number, size: number) {
+  const w = size;
+  const h = size;
+  const x = cx - w / 2;
+  const y = cy - h / 2;
 
-  if (cell.q === 0) {
-    return {
-      position: "absolute",
-      width: "3px",
-      height: "130%",
-      background: "rgba(255, 123, 114, 0.65)",
-      transform: "rotate(-30deg)",
-      pointerEvents: "none",
-      zIndex: 1,
-    };
-  }
-
-  if (cell.r === 0) {
-    return {
-      position: "absolute",
-      width: "130%",
-      height: "3px",
-      background: "rgba(88, 166, 255, 0.65)",
-      pointerEvents: "none",
-      zIndex: 1,
-    };
-  }
-
-  return null;
+  return [
+    `${x + w * 0.25},${y + h * 0.04}`,
+    `${x + w * 0.75},${y + h * 0.04}`,
+    `${x + w},${y + h * 0.5}`,
+    `${x + w * 0.75},${y + h * 0.96}`,
+    `${x + w * 0.25},${y + h * 0.96}`,
+    `${x},${y + h * 0.5}`,
+  ].join(" ");
 }
 
 function getMoveMarkForPiece(piece: Piece | null) {
@@ -1685,6 +1677,71 @@ export default function ThreeShogiApp() {
 
         <main ref={boardWrapRef} style={boardPanelStyle}>
           <div style={{ position: "relative", width: boardSize, height: boardSize }}>
+            <svg
+              width={boardSize}
+              height={boardSize}
+              style={{
+                position: "absolute",
+                inset: 0,
+                pointerEvents: "none",
+                zIndex: 3,
+              }}
+            >
+              <defs>
+                <mask id="axis-mask">
+                  <rect x="0" y="0" width={boardSize} height={boardSize} fill="white" />
+
+                  {CELLS.filter(
+                    (cell) => displayBoard[cell.key] || cell.key === CENTER_KEY
+                  ).map((cell) => {
+                    const p = getPixelForLogicalCoord(cell, viewerSide, boardSize);
+                    const cellSizeForMask = Math.max(
+                      38,
+                      Math.min(56, boardSize / 11.2)
+                    );
+
+                    return (
+                      <polygon
+                        key={`mask-${cell.key}`}
+                        points={getHexPolygonPoints(p.x, p.y, cellSizeForMask + 4)}
+                        fill="black"
+                      />
+                    );
+                  })}
+                </mask>
+              </defs>
+
+              {[
+                {
+                  a: { q: -4, r: 0 },
+                  b: { q: 4, r: 0 },
+                  color: "#58a6ff",
+                },
+                {
+                  a: { q: 0, r: -4 },
+                  b: { q: 0, r: 4 },
+                  color: "#ff7b72",
+                },
+              ].map((axis, index) => {
+                const p1 = getPixelForLogicalCoord(axis.a, viewerSide, boardSize);
+                const p2 = getPixelForLogicalCoord(axis.b, viewerSide, boardSize);
+
+                return (
+                  <line
+                    key={index}
+                    x1={p1.x}
+                    y1={p1.y}
+                    x2={p2.x}
+                    y2={p2.y}
+                    stroke={axis.color}
+                    strokeWidth="2.5"
+                    strokeOpacity="0.75"
+                    mask="url(#axis-mask)"
+                  />
+                );
+              })}
+            </svg>
+
             {CELLS.map((cell) => {
               const visualCell = rotateCoordForViewer(cell, viewerSide);
               const p = getCellPixel(visualCell, boardSize);
@@ -1749,9 +1806,6 @@ export default function ThreeShogiApp() {
                       : "none",
                   }}
                 >
-                  {isAxisCell(cell) && !isCenter && (
-                    <span style={getAxisLineStyle(cell) ?? undefined} />
-                  )}
 
                   {piece ? (
                     <div
