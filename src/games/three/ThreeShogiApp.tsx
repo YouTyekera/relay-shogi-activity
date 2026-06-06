@@ -609,14 +609,6 @@ function checkedSidesBy(board: BoardMap, attacker: Side, aliveSides: Side[]) {
   });
 }
 
-function firstCheckedSideBy(
-  board: BoardMap,
-  attacker: Side,
-  aliveSides: Side[]
-) {
-  return checkedSidesBy(board, attacker, aliveSides)[0] ?? null;
-}
-
 function getCellPixel(c: Coord, boardSize: number) {
   const size = boardSize / 19.4;
   const x = size * Math.sqrt(3) * (c.q + c.r / 2);
