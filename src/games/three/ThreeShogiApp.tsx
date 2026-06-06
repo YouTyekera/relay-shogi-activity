@@ -11,7 +11,7 @@ const discordSdk = isDiscordActivity ? new DiscordSDK(CLIENT_ID) : null;
 
 type Side = "red" | "blue" | "green";
 type GameStatus = "lobby" | "playing" | "finished";
-type PieceName = "歩" | "と" | "騎" | "香" | "成香" | "角" | "飛" | "王" | "馬" | "竜";
+type PieceName = "歩" | "と" | "騎" | "香" | "杏" | "角" | "飛" | "王" | "馬" | "竜";
 type DroppablePieceName = "歩" | "騎" | "香" | "角" | "飛";
 
 type Coord = { q: number; r: number };
@@ -226,7 +226,7 @@ function demoteCapturedPiece(name: PieceName): DroppablePieceName | null {
   if (name === "と") return "歩";
   if (name === "馬") return "角";
   if (name === "竜") return "飛";
-  if (name === "成香") return "香";
+  if (name === "杏") return "香";
   return name as DroppablePieceName;
 }
 
@@ -330,7 +330,7 @@ function promotePieceName(name: PieceName): PieceName {
   if (name === "歩") return "と";
   if (name === "角") return "馬";
   if (name === "飛") return "竜";
-  if (name === "香") return "成香";
+  if (name === "香") return "杏";
   return name;
 }
 
@@ -351,8 +351,13 @@ function isInPromotionZone(side: Side, to: Coord) {
   return s <= -3;
 }
 
-function shouldPromote(piece: Piece, to: Coord) {
+function shouldPromote(piece: Piece, from: Coord, to: Coord) {
   if (!canPromote(piece)) return false;
+
+  // 中央に打ち込まれた駒が中央から外へ出るときは成る。
+  if (keyOf(from) === CENTER_KEY && keyOf(to) !== CENTER_KEY) return true;
+
+  // 通常は、各陣営から見た敵陣の奥側2行に到達したときだけ成る。
   return isInPromotionZone(piece.side, to);
 }
 
@@ -375,7 +380,7 @@ function isLegalPieceMove(
 
   if (piece.name === "王") return distance === 1;
   if (piece.name === "と") return distance === 1;
-  if (piece.name === "成香") return distance === 1;
+  if (piece.name === "杏") return distance === 1;
 
   if (piece.name === "歩") {
     return getPawnForwardDirs(piece.side).some((dir) => sameCoord(diff, dir));
@@ -386,12 +391,15 @@ function isLegalPieceMove(
   }
 
   if (piece.name === "香") {
-    const pawnLikeForward = getPawnForwardDirs(piece.side).some((dir) => sameCoord(diff, dir));
+    // 歩と同じ前斜め2方向に1マス。
+    const pawnLikeForward = getPawnForwardDirs(piece.side).some((dir) =>
+      sameCoord(diff, dir)
+    );
     if (pawnLikeForward) return true;
 
+    // 真正面には「一マス飛び」を1回だけ進める。後ろには下がれない。
     const forwardJumpDir = getRookForwardJumpDirs(piece.side)[0];
-    const n = stepCount(diff, forwardJumpDir);
-    return n >= 1 && isPathClear(board, from, to, forwardJumpDir);
+    return sameCoord(diff, forwardJumpDir);
   }
 
   if (piece.name === "角") {
@@ -478,7 +486,7 @@ function simulateMove(board: BoardMap, from: Coord, to: Coord) {
   if (!moving) return next;
 
   next[keyOf(from)] = null;
-  next[keyOf(to)] = shouldPromote(moving, to)
+  next[keyOf(to)] = shouldPromote(moving, from, to)
     ? { ...moving, name: promotePieceName(moving.name), promoted: true }
     : moving;
 
@@ -675,7 +683,7 @@ function getMoveMarkForPiece(piece: Piece | null) {
   if (!piece) return "●";
   if (piece.name === "角" || piece.name === "馬") return "↗";
   if (piece.name === "飛" || piece.name === "竜") return "➜";
-  if (piece.name === "香" || piece.name === "成香") return "香";
+  if (piece.name === "香" || piece.name === "杏") return "●";
   return "●";
 }
 
@@ -824,7 +832,7 @@ export default function ThreeShogiApp() {
 
     let src = "/bgm/main.mp3";
     if (reviewMode || gameStatus === "finished") src = "/bgm/review.mp3";
-    else if (moveNumber >= 50) src = "/bgm/calm.mp3";
+    else if (moveNumber >= 40) src = "/bgm/calm.mp3";
 
     if (!audio.src.endsWith(src)) {
       audio.src = src;
@@ -1373,7 +1381,7 @@ export default function ThreeShogiApp() {
       ? addHand(hands, fromPiece.side, captured.name)
       : cloneHands(hands);
 
-    const movedPiece: Piece = shouldPromote(fromPiece, cell)
+    const movedPiece: Piece = shouldPromote(fromPiece, selected, cell)
       ? { ...fromPiece, name: promotePieceName(fromPiece.name), promoted: true }
       : fromPiece;
 
@@ -1949,9 +1957,9 @@ export default function ThreeShogiApp() {
             <br />
             騎：6方向に1マスジャンプ
             <br />
-            香：前斜め1マス、または真正面に一マス飛びずつ
+            香：前斜め2方向に1マス、または真正面に一マス飛びを1回
             <br />
-            成香：6方向1マス
+            杏：6方向1マス
             <br />
             角：自軍から見て斜め4方向に何マスでも
             <br />
