@@ -11,7 +11,7 @@ const discordSdk = isDiscordActivity ? new DiscordSDK(CLIENT_ID) : null;
 
 type Side = "red" | "blue" | "green";
 type GameStatus = "lobby" | "playing" | "finished";
-type PieceName = "歩" | "と" | "騎" | "香" | "角" | "飛" | "王" | "馬" | "竜" | "杏";
+type PieceName = "歩" | "と" | "騎" | "香" | "成香" | "角" | "飛" | "王" | "馬" | "竜";
 type DroppablePieceName = "歩" | "騎" | "香" | "角" | "飛";
 
 type Coord = { q: number; r: number };
@@ -103,6 +103,7 @@ const DIRS: Coord[] = [
 const BOARD_RADIUS = 4;
 const CENTER_KEY = "0,0";
 const HAND_PIECES: DroppablePieceName[] = ["歩", "騎", "香", "角", "飛"];
+
 function keyOf(c: Coord) {
   return `${c.q},${c.r}`;
 }
@@ -117,16 +118,12 @@ function sameCoord(a: Coord, b: Coord) {
 
 function createCells(radius = BOARD_RADIUS): Cell[] {
   const cells: Cell[] = [];
-
   for (let q = -radius; q <= radius; q++) {
     for (let r = -radius; r <= radius; r++) {
       const s = -q - r;
-      if (Math.abs(s) <= radius) {
-        cells.push({ q, r, key: keyOf({ q, r }) });
-      }
+      if (Math.abs(s) <= radius) cells.push({ q, r, key: keyOf({ q, r }) });
     }
   }
-
   return cells;
 }
 
@@ -229,16 +226,14 @@ function demoteCapturedPiece(name: PieceName): DroppablePieceName | null {
   if (name === "と") return "歩";
   if (name === "馬") return "角";
   if (name === "竜") return "飛";
-  if (name === "杏") return "香";
+  if (name === "成香") return "香";
   return name as DroppablePieceName;
 }
 
 function addHand(hands: Hands, side: Side, captured: PieceName): Hands {
   const handName = demoteCapturedPiece(captured);
   const next = cloneHands(hands);
-
   if (!handName) return next;
-
   next[side][handName] = (next[side][handName] ?? 0) + 1;
   return next;
 }
@@ -246,10 +241,8 @@ function addHand(hands: Hands, side: Side, captured: PieceName): Hands {
 function removeHand(hands: Hands, side: Side, name: DroppablePieceName): Hands {
   const next = cloneHands(hands);
   const current = next[side][name] ?? 0;
-
   if (current <= 1) delete next[side][name];
   else next[side][name] = current - 1;
-
   return next;
 }
 
@@ -323,7 +316,6 @@ function stepCount(diff: Coord, dir: Coord) {
 
 function isPathClear(board: BoardMap, from: Coord, to: Coord, dir: Coord) {
   const n = stepCount(coordDiff(from, to), dir);
-
   if (n <= 1) return true;
 
   for (let i = 1; i < n; i++) {
@@ -338,24 +330,30 @@ function promotePieceName(name: PieceName): PieceName {
   if (name === "歩") return "と";
   if (name === "角") return "馬";
   if (name === "飛") return "竜";
-  if (name === "香") return "杏";
+  if (name === "香") return "成香";
   return name;
 }
 
 function canPromote(piece: Piece) {
-  return piece.name === "歩" || piece.name === "角" || piece.name === "飛" || piece.name === "香";
+  return (
+    piece.name === "歩" ||
+    piece.name === "角" ||
+    piece.name === "飛" ||
+    piece.name === "香"
+  );
+}
+
+function isInPromotionZone(side: Side, to: Coord) {
+  // どの陣営から見ても「敵陣奥側2行」だけ。
+  if (side === "red") return to.r <= -3;
+  if (side === "blue") return to.q <= -3;
+  const s = -to.q - to.r;
+  return s <= -3;
 }
 
 function shouldPromote(piece: Piece, to: Coord) {
   if (!canPromote(piece)) return false;
-  if (keyOf(to) === CENTER_KEY) return true;
-  if (piece.side === "red" && to.r <= -2) return true;
-  if (piece.side === "blue" && to.q <= -2) return true;
-
-  const s = -to.q - to.r;
-  if (piece.side === "green" && s <= -2) return true;
-
-  return false;
+  return isInPromotionZone(piece.side, to);
 }
 
 function isLegalPieceMove(
@@ -369,7 +367,6 @@ function isLegalPieceMove(
   if (sameCoord(from, to)) return false;
 
   const target = board[keyOf(to)];
-
   if (target?.side === piece.side) return false;
   if (target?.inactive && target.name === "王") return false;
 
@@ -378,7 +375,7 @@ function isLegalPieceMove(
 
   if (piece.name === "王") return distance === 1;
   if (piece.name === "と") return distance === 1;
-  if (piece.name === "杏") return distance === 1;
+  if (piece.name === "成香") return distance === 1;
 
   if (piece.name === "歩") {
     return getPawnForwardDirs(piece.side).some((dir) => sameCoord(diff, dir));
@@ -388,17 +385,19 @@ function isLegalPieceMove(
     return DIRS.some((dir) => sameCoord(diff, add({ q: 0, r: 0 }, dir, 2)));
   }
 
+  if (piece.name === "香") {
+    const pawnLikeForward = getPawnForwardDirs(piece.side).some((dir) => sameCoord(diff, dir));
+    if (pawnLikeForward) return true;
+
+    const forwardJumpDir = getRookForwardJumpDirs(piece.side)[0];
+    const n = stepCount(diff, forwardJumpDir);
+    return n >= 1 && isPathClear(board, from, to, forwardJumpDir);
+  }
+
   if (piece.name === "角") {
     return getDiagonalDirs(piece.side).some(
       (dir) => isSameDirection(diff, dir) && isPathClear(board, from, to, dir)
     );
-  }
-
-  if (piece.name === "香") {
-    const forwardDir = getRookForwardJumpDirs(piece.side)[0];
-
-    const n = stepCount(diff, forwardDir);
-    return n >= 1 && isPathClear(board, from, to, forwardDir);
   }
 
   if (piece.name === "飛") {
@@ -602,16 +601,20 @@ function nextSideAfterElimination(
   return mover;
 }
 
-function checkedSidesBy(
-  board: BoardMap,
-  attacker: Side,
-  aliveSides: Side[]
-) {
+function checkedSidesBy(board: BoardMap, attacker: Side, aliveSides: Side[]) {
   return SIDES.filter((side) => {
     if (side === attacker) return false;
     if (!aliveSides.includes(side)) return false;
     return isSideInCheck(board, side, aliveSides);
   });
+}
+
+function firstCheckedSideBy(
+  board: BoardMap,
+  attacker: Side,
+  aliveSides: Side[]
+) {
+  return checkedSidesBy(board, attacker, aliveSides)[0] ?? null;
 }
 
 function getCellPixel(c: Coord, boardSize: number) {
@@ -623,6 +626,31 @@ function getCellPixel(c: Coord, boardSize: number) {
     x: x + boardSize / 2,
     y: y + boardSize / 2,
   };
+}
+
+function getPixelForLogicalCoord(
+  c: Coord,
+  viewerSide: Side | null,
+  boardSize: number
+) {
+  const visual = rotateCoordForViewer(c, viewerSide);
+  return getCellPixel(visual, boardSize);
+}
+
+function getHexPolygonPoints(cx: number, cy: number, size: number) {
+  const w = size;
+  const h = size;
+  const x = cx - w / 2;
+  const y = cy - h / 2;
+
+  return [
+    `${x + w * 0.25},${y + h * 0.04}`,
+    `${x + w * 0.75},${y + h * 0.04}`,
+    `${x + w},${y + h * 0.5}`,
+    `${x + w * 0.75},${y + h * 0.96}`,
+    `${x + w * 0.25},${y + h * 0.96}`,
+    `${x},${y + h * 0.5}`,
+  ].join(" ");
 }
 
 function getFacingVector(side: Side): Coord {
@@ -651,35 +679,11 @@ function getPieceRotationDeg(pieceSide: Side, viewerSide: Side | null) {
   return (Math.atan2(p.x, -p.y) * 180) / Math.PI;
 }
 
-function getPixelForLogicalCoord(
-  c: Coord,
-  viewerSide: Side | null,
-  boardSize: number
-) {
-  const visual = rotateCoordForViewer(c, viewerSide);
-  return getCellPixel(visual, boardSize);
-}
-
-function getHexPolygonPoints(cx: number, cy: number, size: number) {
-  const w = size;
-  const h = size;
-  const x = cx - w / 2;
-  const y = cy - h / 2;
-
-  return [
-    `${x + w * 0.25},${y + h * 0.04}`,
-    `${x + w * 0.75},${y + h * 0.04}`,
-    `${x + w},${y + h * 0.5}`,
-    `${x + w * 0.75},${y + h * 0.96}`,
-    `${x + w * 0.25},${y + h * 0.96}`,
-    `${x},${y + h * 0.5}`,
-  ].join(" ");
-}
-
 function getMoveMarkForPiece(piece: Piece | null) {
   if (!piece) return "●";
   if (piece.name === "角" || piece.name === "馬") return "↗";
   if (piece.name === "飛" || piece.name === "竜") return "➜";
+  if (piece.name === "香" || piece.name === "成香") return "香";
   return "●";
 }
 
@@ -1173,9 +1177,7 @@ export default function ThreeShogiApp() {
         alive: currentAlive,
         nextTurn: checkedSide,
         nextPendingReturnSide:
-          checkedSides.length >= 2 && currentPendingReturnSide
-            ? null
-            : mover,
+          checkedSides.length >= 2 && currentPendingReturnSide ? null : mover,
         status: "playing" as GameStatus,
         sound: "check" as const,
         extraMessage: `王手！すぐに${SIDE_LABEL[checkedSide]}の手番です。対応後、王手を返さなければ${SIDE_LABEL[mover]}に手番が戻ります。`,
@@ -1699,7 +1701,7 @@ export default function ThreeShogiApp() {
               }}
             >
               <defs>
-                <mask id="axis-mask">
+                <mask id="axis-mask-three-shogi">
                   <rect x="0" y="0" width={boardSize} height={boardSize} fill="white" />
 
                   {CELLS.filter(
@@ -1723,21 +1725,16 @@ export default function ThreeShogiApp() {
               </defs>
 
               {[
-                // q軸：r = 0
                 {
                   a: { q: -4, r: 0 },
                   b: { q: 4, r: 0 },
                   color: "#58a6ff",
                 },
-
-                // r軸：q = 0
                 {
                   a: { q: 0, r: -4 },
                   b: { q: 0, r: 4 },
                   color: "#ff7b72",
                 },
-
-                // s軸：q + r = 0
                 {
                   a: { q: -4, r: 4 },
                   b: { q: 4, r: -4 },
@@ -1757,7 +1754,7 @@ export default function ThreeShogiApp() {
                     stroke={axis.color}
                     strokeWidth="2.5"
                     strokeOpacity="0.55"
-                    mask="url(#axis-mask)"
+                    mask="url(#axis-mask-three-shogi)"
                   />
                 );
               })}
@@ -1827,7 +1824,6 @@ export default function ThreeShogiApp() {
                       : "none",
                   }}
                 >
-
                   {piece ? (
                     <div
                       style={{
@@ -1906,7 +1902,7 @@ export default function ThreeShogiApp() {
           </div>
 
           <div style={{ marginBottom: 8 }}>
-            手番:{" "}
+            手番: {" "}
             <b style={{ color: SIDE_COLOR[currentTurn] }}>
               {SIDE_LABEL[currentTurn]}
             </b>
@@ -1959,7 +1955,11 @@ export default function ThreeShogiApp() {
             <br />
             と：6方向1マス
             <br />
-            騎：6方向に2マスジャンプ
+            騎：6方向に1マスジャンプ
+            <br />
+            香：前斜め1マス、または真正面に一マス飛びずつ
+            <br />
+            成香：6方向1マス
             <br />
             角：自軍から見て斜め4方向に何マスでも
             <br />
@@ -1970,6 +1970,8 @@ export default function ThreeShogiApp() {
             竜：飛＋6方向1マス
             <br />
             王：6方向1マス
+            <br />
+            成り：自軍から見て敵陣奥側2行に入ると自動で成ります。
           </div>
 
           <h2 style={h2Style}>音量</h2>
@@ -2010,7 +2012,7 @@ export default function ThreeShogiApp() {
                       padding: "5px 0",
                     }}
                   >
-                    {m.moveNumber}.{" "}
+                    {m.moveNumber}. {" "}
                     <span style={{ color: SIDE_COLOR[m.side] }}>
                       {SIDE_LABEL[m.side]}
                     </span>{" "}
