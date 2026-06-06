@@ -11,8 +11,8 @@ const discordSdk = isDiscordActivity ? new DiscordSDK(CLIENT_ID) : null;
 
 type Side = "red" | "blue" | "green";
 type GameStatus = "lobby" | "playing" | "finished";
-type PieceName = "歩" | "と" | "騎" | "角" | "飛" | "王" | "馬" | "竜";
-type DroppablePieceName = "歩" | "騎" | "角" | "飛";
+type PieceName = "歩" | "と" | "騎" | "香" | "角" | "飛" | "王" | "馬" | "竜" | "杏";
+type DroppablePieceName = "歩" | "騎" | "香" | "角" | "飛";
 
 type Coord = { q: number; r: number };
 type Cell = Coord & { key: string };
@@ -102,8 +102,7 @@ const DIRS: Coord[] = [
 
 const BOARD_RADIUS = 4;
 const CENTER_KEY = "0,0";
-const HAND_PIECES: DroppablePieceName[] = ["歩", "騎", "角", "飛"];
-
+const HAND_PIECES: DroppablePieceName[] = ["歩", "騎", "香", "角", "飛"];
 function keyOf(c: Coord) {
   return `${c.q},${c.r}`;
 }
@@ -175,7 +174,7 @@ function createInitialBoard(): BoardMap {
   put(board, -3, 4, { side: "red", name: "角" });
   put(board, -2, 4, { side: "red", name: "王" });
   put(board, -1, 4, { side: "red", name: "飛" });
-  put(board, 0, 4, { side: "red", name: "騎" });
+  put(board, 0, 4, { side: "red", name: "香" });
   put(board, -4, 3, { side: "red", name: "歩" });
   put(board, -3, 3, { side: "red", name: "歩" });
   put(board, -2, 3, { side: "red", name: "歩" });
@@ -183,7 +182,7 @@ function createInitialBoard(): BoardMap {
   put(board, 0, 3, { side: "red", name: "歩" });
   put(board, 1, 3, { side: "red", name: "歩" });
 
-  put(board, 4, -4, { side: "blue", name: "騎" });
+  put(board, 4, -4, { side: "blue", name: "香" });
   put(board, 4, -3, { side: "blue", name: "飛" });
   put(board, 4, -2, { side: "blue", name: "王" });
   put(board, 4, -1, { side: "blue", name: "角" });
@@ -195,7 +194,7 @@ function createInitialBoard(): BoardMap {
   put(board, 3, 0, { side: "blue", name: "歩" });
   put(board, 3, 1, { side: "blue", name: "歩" });
 
-  put(board, -4, 0, { side: "green", name: "騎" });
+  put(board, -4, 0, { side: "green", name: "香" });
   put(board, -3, -1, { side: "green", name: "飛" });
   put(board, -2, -2, { side: "green", name: "王" });
   put(board, -1, -3, { side: "green", name: "角" });
@@ -230,6 +229,7 @@ function demoteCapturedPiece(name: PieceName): DroppablePieceName | null {
   if (name === "と") return "歩";
   if (name === "馬") return "角";
   if (name === "竜") return "飛";
+  if (name === "杏") return "香";
   return name as DroppablePieceName;
 }
 
@@ -338,11 +338,12 @@ function promotePieceName(name: PieceName): PieceName {
   if (name === "歩") return "と";
   if (name === "角") return "馬";
   if (name === "飛") return "竜";
+  if (name === "香") return "杏";
   return name;
 }
 
 function canPromote(piece: Piece) {
-  return piece.name === "歩" || piece.name === "角" || piece.name === "飛";
+  return piece.name === "歩" || piece.name === "角" || piece.name === "飛" || piece.name === "香";
 }
 
 function shouldPromote(piece: Piece, to: Coord) {
@@ -377,6 +378,7 @@ function isLegalPieceMove(
 
   if (piece.name === "王") return distance === 1;
   if (piece.name === "と") return distance === 1;
+  if (piece.name === "杏") return distance === 1;
 
   if (piece.name === "歩") {
     return getPawnForwardDirs(piece.side).some((dir) => sameCoord(diff, dir));
@@ -390,6 +392,13 @@ function isLegalPieceMove(
     return getDiagonalDirs(piece.side).some(
       (dir) => isSameDirection(diff, dir) && isPathClear(board, from, to, dir)
     );
+  }
+
+  if (piece.name === "香") {
+    const forwardDir = getRookForwardJumpDirs(piece.side)[0];
+
+    const n = stepCount(diff, forwardDir);
+    return n >= 1 && isPathClear(board, from, to, forwardDir);
   }
 
   if (piece.name === "飛") {
@@ -593,21 +602,16 @@ function nextSideAfterElimination(
   return mover;
 }
 
-function firstCheckedSideBy(
+function checkedSidesBy(
   board: BoardMap,
   attacker: Side,
   aliveSides: Side[]
 ) {
-  for (const side of SIDES) {
-    if (side === attacker) continue;
-    if (!aliveSides.includes(side)) continue;
-
-    if (isSideInCheck(board, side, aliveSides)) {
-      return side;
-    }
-  }
-
-  return null;
+  return SIDES.filter((side) => {
+    if (side === attacker) return false;
+    if (!aliveSides.includes(side)) return false;
+    return isSideInCheck(board, side, aliveSides);
+  });
 }
 
 function getCellPixel(c: Coord, boardSize: number) {
@@ -824,7 +828,7 @@ export default function ThreeShogiApp() {
 
     let src = "/bgm/main.mp3";
     if (reviewMode || gameStatus === "finished") src = "/bgm/review.mp3";
-    else if (moveNumber >= 30) src = "/bgm/calm.mp3";
+    else if (moveNumber >= 50) src = "/bgm/calm.mp3";
 
     if (!audio.src.endsWith(src)) {
       audio.src = src;
@@ -1124,7 +1128,11 @@ export default function ThreeShogiApp() {
     currentAlive: Side[],
     currentPendingReturnSide: Side | null
   ) {
-    const checkedSide = firstCheckedSideBy(nextBoard, mover, currentAlive);
+    const checkedSides = checkedSidesBy(nextBoard, mover, currentAlive);
+    const checkedSide =
+      currentPendingReturnSide && checkedSides.includes(currentPendingReturnSide)
+        ? currentPendingReturnSide
+        : checkedSides[0] ?? null;
 
     if (checkedSide) {
       if (!hasAnyLegalMove(nextBoard, checkedSide, currentAlive, nextHands)) {
@@ -1164,7 +1172,10 @@ export default function ThreeShogiApp() {
         board: nextBoard,
         alive: currentAlive,
         nextTurn: checkedSide,
-        nextPendingReturnSide: mover,
+        nextPendingReturnSide:
+          checkedSides.length >= 2 && currentPendingReturnSide
+            ? null
+            : mover,
         status: "playing" as GameStatus,
         sound: "check" as const,
         extraMessage: `王手！すぐに${SIDE_LABEL[checkedSide]}の手番です。対応後、王手を返さなければ${SIDE_LABEL[mover]}に手番が戻ります。`,
