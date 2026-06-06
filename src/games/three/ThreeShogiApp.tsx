@@ -397,9 +397,10 @@ function isLegalPieceMove(
     );
     if (pawnLikeForward) return true;
 
-    // 真正面には「一マス飛び」を1回だけ進める。後ろには下がれない。
+    // 真正面には「一マス飛び」を何回でも繰り返して進める。後ろには下がれない。
     const forwardJumpDir = getRookForwardJumpDirs(piece.side)[0];
-    return sameCoord(diff, forwardJumpDir);
+    const n = stepCount(diff, forwardJumpDir);
+    return n >= 1 && isPathClear(board, from, to, forwardJumpDir);
   }
 
   if (piece.name === "角") {
@@ -1957,7 +1958,7 @@ export default function ThreeShogiApp() {
             <br />
             騎：6方向に1マスジャンプ
             <br />
-            香：前斜め2方向に1マス、または真正面に一マス飛びを1回
+            香：前斜め2方向に1マス、または真正面に一マス飛びを何回でも
             <br />
             杏：6方向1マス
             <br />
