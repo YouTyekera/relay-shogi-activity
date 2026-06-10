@@ -361,14 +361,6 @@ function canPromote(piece: Piece) {
   );
 }
 
-function isInPromotionZone(side: Side, to: Coord) {
-  // どの陣営から見ても「敵陣奥側2行」だけ。
-  if (side === "red") return to.r <= -3;
-  if (side === "blue") return to.q <= -3;
-  const s = -to.q - to.r;
-  return s <= -3;
-}
-
 function shouldPromote(piece: Piece, from: Coord, to: Coord) {
   if (!canPromote(piece)) return false;
 
