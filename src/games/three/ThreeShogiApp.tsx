@@ -50,6 +50,7 @@ type MoveRecord = {
 type LastMove = {
   from?: string;
   to: string;
+  wasDrop?: boolean;
 };
 
 type SyncState = {
@@ -132,6 +133,23 @@ const CELL_SET = new Set(CELLS.map((c) => c.key));
 
 function isInside(c: Coord) {
   return CELL_SET.has(keyOf(c));
+}
+
+function isPromotionZone(
+  side: Side,
+  c: Coord
+) {
+  if (side === "red") {
+    return c.r <= -3;
+  }
+
+  if (side === "blue") {
+    return c.q <= -3;
+  }
+
+  const s = -c.q - c.r;
+
+  return s <= -3;
 }
 
 function createEmptyBoard(): BoardMap {
@@ -354,11 +372,14 @@ function isInPromotionZone(side: Side, to: Coord) {
 function shouldPromote(piece: Piece, from: Coord, to: Coord) {
   if (!canPromote(piece)) return false;
 
-  // 中央に打ち込まれた駒が中央から外へ出るときは成る。
-  if (keyOf(from) === CENTER_KEY && keyOf(to) !== CENTER_KEY) return true;
+  // 中央に入った直後に成る
+  if (keyOf(to) === CENTER_KEY) return true;
 
-  // 通常は、各陣営から見た敵陣の奥側2行に到達したときだけ成る。
-  return isInPromotionZone(piece.side, to);
+  // 中央から出るときにも成る
+  if (keyOf(from) === CENTER_KEY) return true;
+
+  // 奥2列に入ったら成る
+  return isPromotionZone(piece.side, to);
 }
 
 function isLegalPieceMove(
@@ -688,7 +709,7 @@ function getMoveMarkForPiece(piece: Piece | null) {
   return "●";
 }
 
-function playTone(type: "move" | "capture" | "check" | "drop" | "win") {
+function playTone(type: "move" | "capture" | "check" | "drop" | "win" | "turn") {
   try {
     const AudioContextClass =
       window.AudioContext || (window as any).webkitAudioContext;
@@ -702,6 +723,7 @@ function playTone(type: "move" | "capture" | "check" | "drop" | "win") {
       check: 880,
       drop: 520,
       win: 660,
+      turn: 720
     }[type];
 
     osc.frequency.value = freq;
@@ -1305,7 +1327,10 @@ export default function ThreeShogiApp() {
       ];
 
       const nextMessage = `${moveText}。${decision.extraMessage}`;
-      const nextLastMove: LastMove = { to: cell.key };
+      const nextLastMove = {
+        to: cell.key,
+        wasDrop: true,
+      };
 
       playTone(decision.sound === "move" ? "drop" : decision.sound);
 
@@ -1465,6 +1490,12 @@ export default function ThreeShogiApp() {
     setSelected(null);
     setSelectedHand(null);
     setCurrentTurn(nextTurn);
+    if (
+      nextTurn === mySide ||
+      freeMoveMode
+    ) {
+      playTone("turn");
+    }
     setMoveNumber(nextMoveNumber);
     setMoveHistory(nextHistory);
     setAliveSides(nextAliveSides);
