@@ -53,6 +53,8 @@ type LastMove = {
   wasDrop?: boolean;
 };
 
+type ImpactType = "none" | "check" | "capture" | "drop" | "win";
+
 type SyncState = {
   gameStatus: GameStatus;
   board: BoardMap;
@@ -133,23 +135,6 @@ const CELL_SET = new Set(CELLS.map((c) => c.key));
 
 function isInside(c: Coord) {
   return CELL_SET.has(keyOf(c));
-}
-
-function isPromotionZone(
-  side: Side,
-  c: Coord
-) {
-  if (side === "red") {
-    return c.r <= -3;
-  }
-
-  if (side === "blue") {
-    return c.q <= -3;
-  }
-
-  const s = -c.q - c.r;
-
-  return s <= -3;
 }
 
 function createEmptyBoard(): BoardMap {
@@ -361,17 +346,25 @@ function canPromote(piece: Piece) {
   );
 }
 
+function isInPromotionZone(side: Side, to: Coord) {
+  // どの陣営から見ても「敵陣奥側2行」だけ。
+  if (side === "red") return to.r <= -3;
+  if (side === "blue") return to.q <= -3;
+  const s = -to.q - to.r;
+  return s <= -3;
+}
+
 function shouldPromote(piece: Piece, from: Coord, to: Coord) {
   if (!canPromote(piece)) return false;
 
-  // 中央に入った直後に成る
+  // 中央に入った直後に成る。
   if (keyOf(to) === CENTER_KEY) return true;
 
-  // 中央から出るときにも成る
-  if (keyOf(from) === CENTER_KEY) return true;
+  // 中央に打ち込まれた駒が中央から外へ出るときも成る。
+  if (keyOf(from) === CENTER_KEY && keyOf(to) !== CENTER_KEY) return true;
 
-  // 奥2列に入ったら成る
-  return isPromotionZone(piece.side, to);
+  // 通常は、各陣営から見た敵陣の奥側2行に到達したときだけ成る。
+  return isInPromotionZone(piece.side, to);
 }
 
 function isLegalPieceMove(
@@ -519,6 +512,19 @@ function isLegalMoveConsideringCheck(
   return !isSideInCheck(next, piece.side, aliveSides);
 }
 
+function hasLegalMoveAfterDrop(
+  board: BoardMap,
+  side: Side,
+  name: DroppablePieceName,
+  to: Coord
+) {
+  const droppedPiece: Piece = { side, name };
+
+  return CELLS.some((cell) =>
+    isLegalPieceMove(board, droppedPiece, to, cell)
+  );
+}
+
 function isLegalDrop(
   board: BoardMap,
   side: Side,
@@ -531,6 +537,12 @@ function isLegalDrop(
 
   const next = cloneBoard(board);
   next[keyOf(to)] = { side, name };
+
+  // 歩と香は、次に一手も動けない場所には打てない。
+  // 二歩・打ち歩詰めは見ないが、「行き場なし」は禁止する。
+  if ((name === "歩" || name === "香") && !hasLegalMoveAfterDrop(next, side, name, to)) {
+    return false;
+  }
 
   return !isSideInCheck(next, side, aliveSides);
 }
@@ -715,12 +727,12 @@ function playTone(type: "move" | "capture" | "check" | "drop" | "win" | "turn") 
       check: 880,
       drop: 520,
       win: 660,
-      turn: 720
+      turn: 720,
     }[type];
 
     osc.frequency.value = freq;
-    osc.type = type === "check" ? "square" : "sine";
-    gain.gain.value = 0.06;
+    osc.type = type === "check" ? "square" : type === "turn" ? "triangle" : "sine";
+    gain.gain.value = type === "turn" ? 0.045 : 0.06;
     osc.connect(gain);
     gain.connect(ctx.destination);
     osc.start();
@@ -783,6 +795,8 @@ export default function ThreeShogiApp() {
   const [reviewMode, setReviewMode] = useState(false);
   const [reviewIndex, setReviewIndex] = useState(0);
   const [volume, setVolume] = useState(0.18);
+  const [impact, setImpact] = useState<ImpactType>("none");
+  const previousTurnRef = useRef<Side | null>(null);
 
   const isHost = true;
 
@@ -798,6 +812,32 @@ export default function ThreeShogiApp() {
       ) ?? null
     );
   }, [currentUser, teams]);
+
+  useEffect(() => {
+    if (previousTurnRef.current === null) {
+      previousTurnRef.current = currentTurn;
+      return;
+    }
+
+    const turnChanged = previousTurnRef.current !== currentTurn;
+    previousTurnRef.current = currentTurn;
+
+    if (
+      turnChanged &&
+      gameStatus === "playing" &&
+      !reviewMode &&
+      mySide === currentTurn
+    ) {
+      playTone("turn");
+    }
+  }, [currentTurn, gameStatus, mySide, reviewMode]);
+
+  function triggerImpact(type: ImpactType) {
+    if (type === "none") return;
+    setImpact("none");
+    window.setTimeout(() => setImpact(type), 0);
+    window.setTimeout(() => setImpact("none"), type === "win" ? 520 : 280);
+  }
 
   const viewerSide = mySide ?? currentTurn;
 
@@ -847,7 +887,7 @@ export default function ThreeShogiApp() {
 
     let src = "/bgm/main.mp3";
     if (reviewMode || gameStatus === "finished") src = "/bgm/review.mp3";
-    else if (moveNumber >= 40) src = "/bgm/calm.mp3";
+    else if (moveNumber >= 30) src = "/bgm/calm.mp3";
 
     if (!audio.src.endsWith(src)) {
       audio.src = src;
@@ -1319,12 +1359,10 @@ export default function ThreeShogiApp() {
       ];
 
       const nextMessage = `${moveText}。${decision.extraMessage}`;
-      const nextLastMove = {
-        to: cell.key,
-        wasDrop: true,
-      };
+      const nextLastMove: LastMove = { to: cell.key, wasDrop: true };
 
       playTone(decision.sound === "move" ? "drop" : decision.sound);
+      triggerImpact(decision.sound === "move" ? "drop" : decision.sound);
 
       setBoard(nextBoard);
       setHands(nextHands);
@@ -1476,18 +1514,13 @@ export default function ThreeShogiApp() {
     const nextLastMove: LastMove = { from: keyOf(selected), to: cell.key };
 
     playTone(sound);
+    triggerImpact(sound === "move" ? "none" : sound);
 
     setBoard(nextBoard);
     setHands(nextHands);
     setSelected(null);
     setSelectedHand(null);
     setCurrentTurn(nextTurn);
-    if (
-      nextTurn === mySide ||
-      freeMoveMode
-    ) {
-      playTone("turn");
-    }
     setMoveNumber(nextMoveNumber);
     setMoveHistory(nextHistory);
     setAliveSides(nextAliveSides);
@@ -1516,6 +1549,26 @@ export default function ThreeShogiApp() {
   return (
     <div style={pageStyle}>
       <audio ref={bgmRef} src="/bgm/main.mp3" loop />
+      <style>{`
+        @keyframes three-shogi-check-shake {
+          0% { transform: translate(0, 0); }
+          20% { transform: translate(-8px, 3px); }
+          40% { transform: translate(7px, -3px); }
+          60% { transform: translate(-5px, 2px); }
+          80% { transform: translate(4px, -2px); }
+          100% { transform: translate(0, 0); }
+        }
+        @keyframes three-shogi-hit-pop {
+          0% { transform: scale(1); filter: brightness(1); }
+          45% { transform: scale(1.025); filter: brightness(1.25); }
+          100% { transform: scale(1); filter: brightness(1); }
+        }
+        @keyframes three-shogi-win-flash {
+          0% { filter: brightness(1); }
+          35% { filter: brightness(1.45) saturate(1.35); }
+          100% { filter: brightness(1); }
+        }
+      `}</style>
 
       <header style={headerStyle}>
         <div>
@@ -1712,7 +1765,20 @@ export default function ThreeShogiApp() {
           </button>
         </aside>
 
-        <main ref={boardWrapRef} style={boardPanelStyle}>
+        <main
+          ref={boardWrapRef}
+          style={{
+            ...boardPanelStyle,
+            animation:
+              impact === "check"
+                ? "three-shogi-check-shake 260ms ease-in-out"
+                : impact === "capture" || impact === "drop"
+                ? "three-shogi-hit-pop 220ms ease-out"
+                : impact === "win"
+                ? "three-shogi-win-flash 520ms ease-out"
+                : "none",
+          }}
+        >
           <div style={{ position: "relative", width: boardSize, height: boardSize }}>
             <svg
               width={boardSize}
@@ -1794,6 +1860,7 @@ export default function ThreeShogiApp() {
               const isCenter = cell.key === CENTER_KEY;
               const isLastFrom = !reviewMode && lastMove?.from === cell.key;
               const isLastTo = !reviewMode && lastMove?.to === cell.key;
+              const isLastDrop = isLastTo && !!lastMove?.wasDrop;
               const cellSize = Math.max(38, Math.min(56, boardSize / 11.2));
 
               return (
@@ -1816,6 +1883,8 @@ export default function ThreeShogiApp() {
                       ? "3px solid #ffdf5d"
                       : isLegalDestination
                       ? "2px solid #58a6ff"
+                      : isLastDrop
+                      ? "4px solid #00e5ff"
                       : isLastTo
                       ? "3px solid #ff9f43"
                       : isLastFrom
@@ -1829,6 +1898,8 @@ export default function ThreeShogiApp() {
                       ? "#4b3b10"
                       : isLegalDestination
                       ? "#102a43"
+                      : isLastDrop
+                      ? "#073642"
                       : isLastTo
                       ? "#3a2410"
                       : "#161b22",
@@ -1843,6 +1914,8 @@ export default function ThreeShogiApp() {
                     overflow: "hidden",
                     boxShadow: isCenter
                       ? "0 0 18px rgba(255, 223, 93, 0.6)"
+                      : isLastDrop
+                      ? "0 0 26px rgba(0, 229, 255, 0.95), inset 0 0 16px rgba(0, 229, 255, 0.35)"
                       : isLastTo
                       ? "0 0 18px rgba(255, 159, 67, 0.8)"
                       : "none",
@@ -1910,6 +1983,25 @@ export default function ThreeShogiApp() {
                       }}
                     >
                       {cell.q},{cell.r}
+                    </span>
+                  )}
+
+                  {isLastDrop && (
+                    <span
+                      style={{
+                        position: "absolute",
+                        right: 3,
+                        bottom: 3,
+                        zIndex: 4,
+                        padding: "1px 4px",
+                        borderRadius: 999,
+                        background: "#00e5ff",
+                        color: "#001018",
+                        fontSize: 10,
+                        fontWeight: 900,
+                      }}
+                    >
+                      打
                     </span>
                   )}
                 </button>
