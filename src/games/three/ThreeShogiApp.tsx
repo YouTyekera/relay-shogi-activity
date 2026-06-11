@@ -53,7 +53,7 @@ type LastMove = {
   wasDrop?: boolean;
 };
 
-type ImpactType = "none" | "check" | "capture" | "drop" | "win";
+type ImpactType = "none" | "check";
 
 type SyncState = {
   gameStatus: GameStatus;
@@ -718,6 +718,29 @@ function playTone(type: "move" | "capture" | "check" | "drop" | "win" | "turn") 
     const AudioContextClass =
       window.AudioContext || (window as any).webkitAudioContext;
     const ctx = new AudioContextClass();
+
+    if (type === "turn") {
+      const notes = [740, 960, 1220];
+      notes.forEach((freq, index) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        const startTime = ctx.currentTime + index * 0.085;
+        const endTime = startTime + 0.075;
+
+        osc.frequency.value = freq;
+        osc.type = "triangle";
+        gain.gain.setValueAtTime(0.0, startTime);
+        gain.gain.linearRampToValueAtTime(0.07, startTime + 0.012);
+        gain.gain.exponentialRampToValueAtTime(0.001, endTime);
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(startTime);
+        osc.stop(endTime);
+      });
+      return;
+    }
+
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
 
@@ -727,12 +750,11 @@ function playTone(type: "move" | "capture" | "check" | "drop" | "win" | "turn") 
       check: 880,
       drop: 520,
       win: 660,
-      turn: 720,
     }[type];
 
     osc.frequency.value = freq;
-    osc.type = type === "check" ? "square" : type === "turn" ? "triangle" : "sine";
-    gain.gain.value = type === "turn" ? 0.045 : 0.06;
+    osc.type = type === "check" ? "square" : "sine";
+    gain.gain.value = 0.06;
     osc.connect(gain);
     gain.connect(ctx.destination);
     osc.start();
@@ -833,10 +855,10 @@ export default function ThreeShogiApp() {
   }, [currentTurn, gameStatus, mySide, reviewMode]);
 
   function triggerImpact(type: ImpactType) {
-    if (type === "none") return;
+    if (type !== "check") return;
     setImpact("none");
-    window.setTimeout(() => setImpact(type), 0);
-    window.setTimeout(() => setImpact("none"), type === "win" ? 520 : 280);
+    window.setTimeout(() => setImpact("check"), 0);
+    window.setTimeout(() => setImpact("none"), 280);
   }
 
   const viewerSide = mySide ?? currentTurn;
@@ -1359,10 +1381,10 @@ export default function ThreeShogiApp() {
       ];
 
       const nextMessage = `${moveText}。${decision.extraMessage}`;
-      const nextLastMove: LastMove = { to: cell.key, wasDrop: true };
+      const nextLastMove: LastMove = { to: cell.key };
 
       playTone(decision.sound === "move" ? "drop" : decision.sound);
-      triggerImpact(decision.sound === "move" ? "drop" : decision.sound);
+      if (decision.sound === "check") triggerImpact("check");
 
       setBoard(nextBoard);
       setHands(nextHands);
@@ -1514,7 +1536,7 @@ export default function ThreeShogiApp() {
     const nextLastMove: LastMove = { from: keyOf(selected), to: cell.key };
 
     playTone(sound);
-    triggerImpact(sound === "move" ? "none" : sound);
+    if (sound === "check") triggerImpact("check");
 
     setBoard(nextBoard);
     setHands(nextHands);
@@ -1557,16 +1579,6 @@ export default function ThreeShogiApp() {
           60% { transform: translate(-5px, 2px); }
           80% { transform: translate(4px, -2px); }
           100% { transform: translate(0, 0); }
-        }
-        @keyframes three-shogi-hit-pop {
-          0% { transform: scale(1); filter: brightness(1); }
-          45% { transform: scale(1.025); filter: brightness(1.25); }
-          100% { transform: scale(1); filter: brightness(1); }
-        }
-        @keyframes three-shogi-win-flash {
-          0% { filter: brightness(1); }
-          35% { filter: brightness(1.45) saturate(1.35); }
-          100% { filter: brightness(1); }
         }
       `}</style>
 
@@ -1772,10 +1784,6 @@ export default function ThreeShogiApp() {
             animation:
               impact === "check"
                 ? "three-shogi-check-shake 260ms ease-in-out"
-                : impact === "capture" || impact === "drop"
-                ? "three-shogi-hit-pop 220ms ease-out"
-                : impact === "win"
-                ? "three-shogi-win-flash 520ms ease-out"
                 : "none",
           }}
         >
@@ -1860,7 +1868,6 @@ export default function ThreeShogiApp() {
               const isCenter = cell.key === CENTER_KEY;
               const isLastFrom = !reviewMode && lastMove?.from === cell.key;
               const isLastTo = !reviewMode && lastMove?.to === cell.key;
-              const isLastDrop = isLastTo && !!lastMove?.wasDrop;
               const cellSize = Math.max(38, Math.min(56, boardSize / 11.2));
 
               return (
@@ -1883,8 +1890,6 @@ export default function ThreeShogiApp() {
                       ? "3px solid #ffdf5d"
                       : isLegalDestination
                       ? "2px solid #58a6ff"
-                      : isLastDrop
-                      ? "4px solid #00e5ff"
                       : isLastTo
                       ? "3px solid #ff9f43"
                       : isLastFrom
@@ -1898,8 +1903,6 @@ export default function ThreeShogiApp() {
                       ? "#4b3b10"
                       : isLegalDestination
                       ? "#102a43"
-                      : isLastDrop
-                      ? "#073642"
                       : isLastTo
                       ? "#3a2410"
                       : "#161b22",
@@ -1914,8 +1917,6 @@ export default function ThreeShogiApp() {
                     overflow: "hidden",
                     boxShadow: isCenter
                       ? "0 0 18px rgba(255, 223, 93, 0.6)"
-                      : isLastDrop
-                      ? "0 0 26px rgba(0, 229, 255, 0.95), inset 0 0 16px rgba(0, 229, 255, 0.35)"
                       : isLastTo
                       ? "0 0 18px rgba(255, 159, 67, 0.8)"
                       : "none",
@@ -1983,25 +1984,6 @@ export default function ThreeShogiApp() {
                       }}
                     >
                       {cell.q},{cell.r}
-                    </span>
-                  )}
-
-                  {isLastDrop && (
-                    <span
-                      style={{
-                        position: "absolute",
-                        right: 3,
-                        bottom: 3,
-                        zIndex: 4,
-                        padding: "1px 4px",
-                        borderRadius: 999,
-                        background: "#00e5ff",
-                        color: "#001018",
-                        fontSize: 10,
-                        fontWeight: 900,
-                      }}
-                    >
-                      打
                     </span>
                   )}
                 </button>
