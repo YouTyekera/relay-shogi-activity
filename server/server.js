@@ -529,6 +529,9 @@ const kotobaruBot =
 const RECORD_PREFIX =
   "KOTOBARU_RECORD:";
 
+const SUMMARY_MARKER_PREFIX =
+  "KOTOBARU_SUMMARY_POSTED:";
+
 const CONFIG_TOPIC_PREFIX =
   "KOTOBARU_LOG_CHANNEL:";
 
@@ -821,7 +824,47 @@ async function getKotobaruTextChannel(
     ? channel
     : null;
 }
+/* =========================================================
+ * Bot Ready待機
+ *
+ * Render起動直後に結果が来ても
+ * 即503にしないため。
+ * ======================================================= */
 
+async function waitForKotobaruBotReady(
+  timeoutMs = 20000
+) {
+  if (
+    kotobaruBot.isReady()
+  ) {
+    return true;
+  }
+
+  const started =
+    Date.now();
+
+  while (
+    Date.now() -
+      started <
+    timeoutMs
+  ) {
+    if (
+      kotobaruBot.isReady()
+    ) {
+      return true;
+    }
+
+    await new Promise(
+      (resolve) =>
+        setTimeout(
+          resolve,
+          500
+        )
+    );
+  }
+
+  return kotobaruBot.isReady();
+}
 /* =========================================================
  * 記録チャンネル読み込み
  * ======================================================= */
@@ -1119,7 +1162,107 @@ async function postYesterdayKotobaruSummary() {
     );
   }
 }
+/* =========================================================
+ * 昨日の結果を
+ * 1日1回だけ投稿
+ *
+ * Renderのcronだけに頼らず、
+ * Activityが最初に開かれた時にも実行します。
+ * ======================================================= */
 
+async function ensureYesterdaySummaryForGuild(
+  guildId
+) {
+  const config =
+    await getKotobaruGuildConfig(
+      guildId
+    );
+
+  if (!config) {
+    return {
+      configured: false,
+      posted: false,
+    };
+  }
+
+  const logChannel =
+    await getKotobaruTextChannel(
+      config.logChannelId
+    );
+
+  if (
+    !logChannel ||
+    !(
+      "messages" in
+      logChannel
+    ) ||
+    !(
+      "send" in
+      logChannel
+    )
+  ) {
+    return {
+      configured: true,
+      posted: false,
+    };
+  }
+
+  const today =
+    jstDateKey();
+
+  const yesterday =
+    previousJstDateKey();
+
+  const marker =
+    `${SUMMARY_MARKER_PREFIX}${today}:${yesterday}`;
+
+  /*
+   * 最近のメッセージだけ確認。
+   */
+  const recent =
+    await logChannel.messages.fetch({
+      limit: 100,
+    });
+
+  const alreadyDone =
+    recent.some(
+      (message) =>
+        message.author.bot &&
+        message.content ===
+          marker
+    );
+
+  if (alreadyDone) {
+    return {
+      configured: true,
+      posted: false,
+      alreadyDone: true,
+    };
+  }
+
+  /*
+   * 昨日の記録があれば公開チャンネルへ投稿。
+   */
+  const posted =
+    await postKotobaruSummaryForGuild(
+      guildId,
+      yesterday
+    );
+
+  /*
+   * 昨日の参加者が0人でも
+   * 「確認済み」のマーカーは保存。
+   */
+  await logChannel.send(
+    marker
+  );
+
+  return {
+    configured: true,
+    posted,
+    alreadyDone: false,
+  };
+}
 /* =========================================================
  * /ことばル設定
  * ======================================================= */
@@ -1273,19 +1416,9 @@ async function showKotobaruSetup(
   if (
     !interaction.guild
   ) {
-    return;
-  }
-
-  const config =
-    await refreshKotobaruGuildConfig(
-      interaction.guild
-    );
-
-  if (!config) {
     await interaction.reply({
       content:
-        "まだ設定されていません。結果を表示したいチャンネルで `/ことばル設定` を実行してください。",
-
+        "サーバー内で実行してください。",
       ephemeral:
         true,
     });
@@ -1293,17 +1426,35 @@ async function showKotobaruSetup(
     return;
   }
 
-  await interaction.reply({
-    content:
-      [
-        "現在の設定",
-        `・昨日の結果：<#${config.summaryChannelId}>`,
-        `・記録用：<#${config.logChannelId}>`,
-      ].join("\n"),
-
+  /*
+   * まずDiscordへ
+   * 「処理中」と返す。
+   */
+  await interaction.deferReply({
     ephemeral:
       true,
   });
+
+  const config =
+    await refreshKotobaruGuildConfig(
+      interaction.guild
+    );
+
+  if (!config) {
+    await interaction.editReply(
+      "まだ設定されていません。結果を表示したいチャンネルで `/ことばル設定` を実行してください。"
+    );
+
+    return;
+  }
+
+  await interaction.editReply(
+    [
+      "現在の設定",
+      `・昨日の結果：<#${config.summaryChannelId}>`,
+      `・記録用：<#${config.logChannelId}>`,
+    ].join("\n")
+  );
 }
 
 /* =========================================================
@@ -1588,9 +1739,12 @@ app.post(
         });
     }
 
-    if (
-      !kotobaruBot.isReady()
-    ) {
+    const botReady =
+      await waitForKotobaruBotReady(
+        20000
+      );
+
+    if (!botReady) {
       return res
         .status(503)
         .json({
@@ -1671,6 +1825,14 @@ app.post(
       )}`
     );
 
+    console.log(
+      `ことばル結果保存: ${record.displayName} / 第${record.puzzleNumber}問 / ${
+        record.won
+          ? `${record.attempts}/6`
+          : "失敗"
+      }`
+    );
+
     return res.json({
       ok: true,
     });
@@ -1693,6 +1855,67 @@ app.get(
       botReady:
         kotobaruBot.isReady(),
     });
+  }
+);
+
+app.post(
+  "/api/kotobaru/awake",
+  async (req, res) => {
+    const guildId =
+      req.body?.guildId;
+
+    if (
+      typeof guildId !==
+        "string" ||
+      !guildId
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "guildId is required",
+        });
+    }
+
+    const botReady =
+      await waitForKotobaruBotReady(
+        20000
+      );
+
+    if (!botReady) {
+      return res
+        .status(503)
+        .json({
+          ok: false,
+          botReady: false,
+        });
+    }
+
+    try {
+      const summary =
+        await ensureYesterdaySummaryForGuild(
+          guildId
+        );
+
+      return res.json({
+        ok: true,
+        botReady: true,
+        summary,
+      });
+    } catch (error) {
+      console.error(
+        "ことばル awake エラー:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          botReady:
+            kotobaruBot.isReady(),
+        });
+    }
   }
 );
 
