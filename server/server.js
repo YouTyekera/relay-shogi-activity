@@ -46,14 +46,14 @@ const SHOGI_CLIENT_SECRET =
  * 環境変数も完全に分けます。
  */
 const KOTOBARU_CLIENT_ID =
-  process.env.KOTOBARU_DISCORD_CLIENT_ID;
+  process.env.KOTOBARU_DISCORD_CLIENT_ID?.trim();
+
 
 const KOTOBARU_CLIENT_SECRET =
-  process.env.KOTOBARU_DISCORD_CLIENT_SECRET;
+  process.env.KOTOBARU_DISCORD_CLIENT_SECRET?.trim();
 
 const KOTOBARU_BOT_TOKEN =
-  process.env.KOTOBARU_DISCORD_TOKEN;
-
+  process.env.KOTOBARU_DISCORD_TOKEN?.trim();
 /* =========================================================
  * パス
  * ======================================================= */
@@ -1723,14 +1723,20 @@ cron.schedule(
  * ことばルBot起動
  * ======================================================= */
 
-if (
-  KOTOBARU_BOT_TOKEN
-) {
+if (KOTOBARU_BOT_TOKEN) {
+
+  console.log(
+    "ことばルBot起動処理を開始します。"
+  );
+
+  console.log(
+    `KOTOBARU_DISCORD_TOKEN: 設定済み / 文字数 ${KOTOBARU_BOT_TOKEN.length}`
+  );
+
   kotobaruBot.once(
     Events.ClientReady,
-    async (
-      readyClient
-    ) => {
+    async (readyClient) => {
+
       console.log(
         `ことばル Bot ready: ${readyClient.user.tag}`
       );
@@ -1756,29 +1762,28 @@ if (
   );
 
   kotobaruBot.on(
-    Events.GuildCreate,
-    async (guild) => {
-      try {
-        await guild.commands.set(
-          kotobaruCommands
-        );
-
-        console.log(
-          `ことばル新規サーバー設定完了: ${guild.name}`
-        );
-      } catch (error) {
-        console.error(
-          "ことばルGuildCreateエラー:",
-          error
-        );
-      }
+    Events.Error,
+    (error) => {
+      console.error(
+        "ことばルDiscord Client Error:",
+        error
+      );
     }
+  );
+
+  console.log(
+    "Discord Botへログインを試みます..."
   );
 
   kotobaruBot
     .login(
       KOTOBARU_BOT_TOKEN
     )
+    .then(() => {
+      console.log(
+        "Discord login() 呼び出し成功"
+      );
+    })
     .catch(
       (error) => {
         console.error(
@@ -1787,7 +1792,9 @@ if (
         );
       }
     );
+
 } else {
+
   console.warn(
     "KOTOBARU_DISCORD_TOKEN が未設定です。"
   );
