@@ -1723,7 +1723,61 @@ cron.schedule(
  * ことばルBot起動
  * ======================================================= */
 
-if (KOTOBARU_BOT_TOKEN) {
+async function checkKotobaruBotToken() {
+  try {
+    const response = await fetch(
+      "https://discord.com/api/v10/users/@me",
+      {
+        headers: {
+          Authorization: `Bot ${KOTOBARU_BOT_TOKEN}`,
+        },
+      }
+    );
+
+    const text = await response.text();
+
+    if (!response.ok) {
+      console.error(
+        `ことばルBot Token確認失敗: HTTP ${response.status}`
+      );
+
+      /*
+       * Tokenそのものは絶対にログへ出さない。
+       */
+      console.error(
+        "Discord API応答:",
+        text
+      );
+
+      return false;
+    }
+
+    const user = JSON.parse(text);
+
+    console.log(
+      `ことばルBot Token確認成功: ${user.username}`
+    );
+
+    return true;
+  } catch (error) {
+    console.error(
+      "ことばルBot Token確認通信エラー:",
+      error
+    );
+
+    return false;
+  }
+}
+
+
+async function startKotobaruBot() {
+  if (!KOTOBARU_BOT_TOKEN) {
+    console.warn(
+      "KOTOBARU_DISCORD_TOKEN が未設定です。"
+    );
+
+    return;
+  }
 
   console.log(
     "ことばルBot起動処理を開始します。"
@@ -1733,15 +1787,39 @@ if (KOTOBARU_BOT_TOKEN) {
     `KOTOBARU_DISCORD_TOKEN: 設定済み / 文字数 ${KOTOBARU_BOT_TOKEN.length}`
   );
 
+  /*
+   * まずDiscord REST APIで
+   * Tokenそのものが正しいか確認します。
+   */
+  const tokenOk =
+    await checkKotobaruBotToken();
+
+  if (!tokenOk) {
+    console.error(
+      "TokenがDiscordに拒否されたため、Bot起動を中止します。"
+    );
+
+    return;
+  }
+
+  /*
+   * Readyイベント
+   */
   kotobaruBot.once(
     Events.ClientReady,
     async (readyClient) => {
-
       console.log(
         `ことばル Bot ready: ${readyClient.user.tag}`
       );
 
-      await registerKotobaruCommands();
+      try {
+        await registerKotobaruCommands();
+      } catch (error) {
+        console.error(
+          "ことばルコマンド同期処理エラー:",
+          error
+        );
+      }
 
       for (
         const guild of
@@ -1761,6 +1839,9 @@ if (KOTOBARU_BOT_TOKEN) {
     }
   );
 
+  /*
+   * Discord Client自体のエラー
+   */
   kotobaruBot.on(
     Events.Error,
     (error) => {
@@ -1772,33 +1853,56 @@ if (KOTOBARU_BOT_TOKEN) {
   );
 
   console.log(
-    "Discord Botへログインを試みます..."
+    "Discord Gatewayへ接続を開始します..."
   );
 
-  kotobaruBot
-    .login(
-      KOTOBARU_BOT_TOKEN
-    )
-    .then(() => {
-      console.log(
-        "Discord login() 呼び出し成功"
-      );
-    })
-    .catch(
-      (error) => {
+  /*
+   * 60秒経ってもReadyにならない場合に
+   * 分かるようにする。
+   */
+  const timeout = setTimeout(
+    () => {
+      if (!kotobaruBot.isReady()) {
         console.error(
-          "ことばルBotログイン失敗:",
-          error
+          "ことばルBot: 60秒経過してもDiscord Gatewayへの接続が完了していません。"
         );
       }
+    },
+    60000
+  );
+
+  try {
+    await kotobaruBot.login(
+      KOTOBARU_BOT_TOKEN
     );
 
-} else {
+    console.log(
+      "Discord login() 処理完了"
+    );
 
-  console.warn(
-    "KOTOBARU_DISCORD_TOKEN が未設定です。"
-  );
+    clearTimeout(timeout);
+  } catch (error) {
+    clearTimeout(timeout);
+
+    console.error(
+      "ことばルBotログイン失敗:",
+      error
+    );
+  }
 }
+
+
+/*
+ * Bot起動
+ */
+startKotobaruBot().catch(
+  (error) => {
+    console.error(
+      "ことばルBot起動処理全体でエラー:",
+      error
+    );
+  }
+);
 
 /* =========================================================
  * 三人将棋のdist配信
