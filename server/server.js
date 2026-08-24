@@ -1722,54 +1722,6 @@ cron.schedule(
 /* =========================================================
  * ことばルBot起動
  * ======================================================= */
-
-async function checkKotobaruBotToken() {
-  try {
-    const response = await fetch(
-      "https://discord.com/api/v10/users/@me",
-      {
-        headers: {
-          Authorization: `Bot ${KOTOBARU_BOT_TOKEN}`,
-        },
-      }
-    );
-
-    const text = await response.text();
-
-    if (!response.ok) {
-      console.error(
-        `ことばルBot Token確認失敗: HTTP ${response.status}`
-      );
-
-      /*
-       * Tokenそのものは絶対にログへ出さない。
-       */
-      console.error(
-        "Discord API応答:",
-        text
-      );
-
-      return false;
-    }
-
-    const user = JSON.parse(text);
-
-    console.log(
-      `ことばルBot Token確認成功: ${user.username}`
-    );
-
-    return true;
-  } catch (error) {
-    console.error(
-      "ことばルBot Token確認通信エラー:",
-      error
-    );
-
-    return false;
-  }
-}
-
-
 async function startKotobaruBot() {
   if (!KOTOBARU_BOT_TOKEN) {
     console.warn(
@@ -1788,22 +1740,7 @@ async function startKotobaruBot() {
   );
 
   /*
-   * まずDiscord REST APIで
-   * Tokenそのものが正しいか確認します。
-   */
-  const tokenOk =
-    await checkKotobaruBotToken();
-
-  if (!tokenOk) {
-    console.error(
-      "TokenがDiscordに拒否されたため、Bot起動を中止します。"
-    );
-
-    return;
-  }
-
-  /*
-   * Readyイベント
+   * BotがDiscordに接続できたとき
    */
   kotobaruBot.once(
     Events.ClientReady,
@@ -1812,6 +1749,9 @@ async function startKotobaruBot() {
         `ことばル Bot ready: ${readyClient.user.tag}`
       );
 
+      /*
+       * スラッシュコマンド同期
+       */
       try {
         await registerKotobaruCommands();
       } catch (error) {
@@ -1821,6 +1761,9 @@ async function startKotobaruBot() {
         );
       }
 
+      /*
+       * Discordチャンネルから設定復元
+       */
       for (
         const guild of
         readyClient.guilds.cache.values()
@@ -1840,7 +1783,7 @@ async function startKotobaruBot() {
   );
 
   /*
-   * Discord Client自体のエラー
+   * Discord Clientエラー
    */
   kotobaruBot.on(
     Events.Error,
@@ -1857,18 +1800,17 @@ async function startKotobaruBot() {
   );
 
   /*
-   * 60秒経ってもReadyにならない場合に
-   * 分かるようにする。
+   * 90秒経ってもReadyにならない場合だけ警告
    */
   const timeout = setTimeout(
     () => {
       if (!kotobaruBot.isReady()) {
-        console.error(
-          "ことばルBot: 60秒経過してもDiscord Gatewayへの接続が完了していません。"
+        console.warn(
+          "ことばルBot: 90秒経過してもDiscord Gatewayへの接続が完了していません。"
         );
       }
     },
-    60000
+    90000
   );
 
   try {
@@ -1876,11 +1818,11 @@ async function startKotobaruBot() {
       KOTOBARU_BOT_TOKEN
     );
 
+    clearTimeout(timeout);
+
     console.log(
       "Discord login() 処理完了"
     );
-
-    clearTimeout(timeout);
   } catch (error) {
     clearTimeout(timeout);
 
