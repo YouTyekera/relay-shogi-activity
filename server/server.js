@@ -54,7 +54,108 @@ const KOTOBARU_CLIENT_SECRET =
 
 const KOTOBARU_BOT_TOKEN =
   process.env.KOTOBARU_DISCORD_TOKEN?.trim();
+
 /* =========================================================
+ * Discord REST API
+ *
+ * ことばルの主要処理は、
+ * Discord Gateway接続に依存せず
+ * REST APIで実行します。
+ * ======================================================= */
+
+const DISCORD_API =
+  "https://discord.com/api/v10";
+
+function wait(
+  milliseconds
+) {
+  return new Promise(
+    (resolve) =>
+      setTimeout(
+        resolve,
+        milliseconds
+      )
+  );
+}
+
+async function discordRest(
+  endpoint,
+  options = {},
+  attempt = 1
+) {
+  if (
+    !KOTOBARU_BOT_TOKEN
+  ) {
+    throw new Error(
+      "KOTOBARU_DISCORD_TOKEN がありません"
+    );
+  }
+
+  const response =
+    await fetch(
+      `${DISCORD_API}${endpoint}`,
+      {
+        ...options,
+
+        headers: {
+          Authorization:
+            `Bot ${KOTOBARU_BOT_TOKEN}`,
+
+          "Content-Type":
+            "application/json",
+
+          ...(options.headers ||
+            {}),
+        },
+      }
+    );
+
+  /*
+   * Discordの429
+   * Rate Limit
+   */
+  if (
+    response.status ===
+      429 &&
+    attempt <= 5
+  ) {
+    let retryAfter =
+      2;
+
+    try {
+      const data =
+        await response.json();
+
+      retryAfter =
+        Number(
+          data.retry_after
+        ) || 2;
+    } catch {
+      // JSONでなくても2秒待つ
+    }
+
+    console.warn(
+      `Discord REST Rate Limit。${retryAfter}秒待って再試行します。`
+    );
+
+    await wait(
+      Math.ceil(
+        retryAfter *
+          1000
+      )
+    );
+
+    return discordRest(
+      endpoint,
+      options,
+      attempt + 1
+    );
+  }
+
+  return response;
+}
+
+  /* =========================================================
  * パス
  * ======================================================= */
 
@@ -778,6 +879,10 @@ async function refreshKotobaruGuildConfig(
 async function getKotobaruGuildConfig(
   guildId
 ) {
+  /*
+   * メモリキャッシュがあれば
+   * まずそれを使用。
+   */
   const cached =
     guildConfigs.get(
       guildId
@@ -787,20 +892,104 @@ async function getKotobaruGuildConfig(
     return cached;
   }
 
-  const guild =
-    await kotobaruBot.guilds
-      .fetch(guildId)
-      .catch(
-        () => null
+  /*
+   * Gatewayに頼らず
+   * Discord REST APIから
+   * サーバーのチャンネル一覧を取得。
+   */
+  try {
+    const response =
+      await discordRest(
+        `/guilds/${guildId}/channels`
       );
 
-  if (!guild) {
-    return null;
+    if (!response.ok) {
+      console.error(
+        "ことばル設定取得失敗:",
+        response.status,
+        await response
+          .text()
+          .catch(
+            () => ""
+          )
+      );
+
+      return null;
+    }
+
+    const channels =
+      await response.json();
+
+    /*
+     * CONFIG_TOPIC_PREFIX
+     * が付いているテキストチャンネルを探す。
+     */
+    for (
+      const channel of
+      channels
+    ) {
+      /*
+       * Discord Channel Type 0
+       * = Guild Text
+       */
+      if (
+        channel.type !== 0
+      ) {
+        continue;
+      }
+
+      const topic =
+        channel.topic || "";
+
+      if (
+        !topic.startsWith(
+          CONFIG_TOPIC_PREFIX
+        )
+      ) {
+        continue;
+      }
+
+      const summaryChannelId =
+        topic
+          .slice(
+            CONFIG_TOPIC_PREFIX.length
+          )
+          .split(
+            /\s|\|/
+          )[0]
+          ?.trim();
+
+      if (
+        !summaryChannelId
+      ) {
+        continue;
+      }
+
+      const config = {
+        guildId,
+
+        logChannelId:
+          channel.id,
+
+        summaryChannelId,
+      };
+
+      guildConfigs.set(
+        guildId,
+        config
+      );
+
+      return config;
+    }
+
+  } catch (error) {
+    console.error(
+      "ことばル設定REST取得エラー:",
+      error
+    );
   }
 
-  return refreshKotobaruGuildConfig(
-    guild
-  );
+  return null;
 }
 
 async function getKotobaruTextChannel(
@@ -1721,11 +1910,18 @@ app.post(
 
 /* =========================================================
  * ことばル結果保存
+ *
+ * Discord Gatewayには依存しません。
  * ======================================================= */
 
 app.post(
   "/api/kotobaru/result",
   async (req, res) => {
+
+    /* =========================
+     * 内容チェック
+     * ======================= */
+
     if (
       !validateKotobaruResult(
         req.body
@@ -1739,103 +1935,132 @@ app.post(
         });
     }
 
-    const botReady =
-      await waitForKotobaruBotReady(
-        20000
+    try {
+      /* =========================
+       * 保存先取得
+       * ======================= */
+
+      const config =
+        await getKotobaruGuildConfig(
+          req.body.guildId
+        );
+
+      if (!config) {
+        return res
+          .status(503)
+          .json({
+            error:
+              "ことばル設定が行われていません",
+          });
+      }
+
+      /* =========================
+       * 保存内容
+       * ======================= */
+
+      const record = {
+        guildId:
+          req.body.guildId,
+
+        userId:
+          req.body.userId,
+
+        displayName:
+          req.body.displayName
+            .slice(
+              0,
+              80
+            ),
+
+        puzzleNumber:
+          req.body.puzzleNumber,
+
+        date:
+          req.body.date,
+
+        attempts:
+          req.body.attempts,
+
+        won:
+          req.body.won,
+
+        pattern:
+          req.body.pattern,
+
+        savedAt:
+          new Date()
+            .toISOString(),
+      };
+
+      /* =========================
+       * Discord REST APIで
+       * #ことばル-記録へ投稿
+       * ======================= */
+
+      const response =
+        await discordRest(
+          `/channels/${config.logChannelId}/messages`,
+          {
+            method:
+              "POST",
+
+            body:
+              JSON.stringify({
+                content:
+                  `${RECORD_PREFIX}${JSON.stringify(
+                    record
+                  )}`,
+              }),
+          }
+        );
+
+      if (!response.ok) {
+        const text =
+          await response
+            .text()
+            .catch(
+              () => ""
+            );
+
+        console.error(
+          "ことばル結果Discord保存失敗:",
+          response.status,
+          text
+        );
+
+        return res
+          .status(502)
+          .json({
+            error:
+              "Discord result save failed",
+          });
+      }
+
+      console.log(
+        `ことばル結果保存成功: ${record.displayName} / 第${record.puzzleNumber}問 / ${
+          record.won
+            ? `${record.attempts}/6`
+            : "失敗"
+        }`
       );
 
-    if (!botReady) {
-      return res
-        .status(503)
-        .json({
-          error:
-            "Kotobaru Bot is not ready",
-        });
-    }
+      return res.json({
+        ok: true,
+      });
 
-    const config =
-      await getKotobaruGuildConfig(
-        req.body.guildId
+    } catch (error) {
+      console.error(
+        "ことばル結果保存エラー:",
+        error
       );
 
-    if (!config) {
       return res
-        .status(503)
+        .status(500)
         .json({
           error:
-            "ことばル設定が行われていません",
+            "result save failed",
         });
     }
-
-    const channel =
-      await getKotobaruTextChannel(
-        config.logChannelId
-      );
-
-    if (
-      !channel ||
-      !(
-        "send" in
-        channel
-      )
-    ) {
-      return res
-        .status(503)
-        .json({
-          error:
-            "記録チャンネルを利用できません",
-        });
-    }
-
-    const record = {
-      guildId:
-        req.body.guildId,
-
-      userId:
-        req.body.userId,
-
-      displayName:
-        req.body.displayName.slice(
-          0,
-          80
-        ),
-
-      puzzleNumber:
-        req.body.puzzleNumber,
-
-      date:
-        req.body.date,
-
-      attempts:
-        req.body.attempts,
-
-      won:
-        req.body.won,
-
-      pattern:
-        req.body.pattern,
-
-      savedAt:
-        new Date().toISOString(),
-    };
-
-    await channel.send(
-      `${RECORD_PREFIX}${JSON.stringify(
-        record
-      )}`
-    );
-
-    console.log(
-      `ことばル結果保存: ${record.displayName} / 第${record.puzzleNumber}問 / ${
-        record.won
-          ? `${record.attempts}/6`
-          : "失敗"
-      }`
-    );
-
-    return res.json({
-      ok: true,
-    });
   }
 );
 
@@ -1852,8 +2077,23 @@ app.get(
       service:
         "kotobaru",
 
-      botReady:
+      /*
+       * Gatewayは補助機能。
+       */
+      gatewayReady:
         kotobaruBot.isReady(),
+
+      /*
+       * ゲームの結果保存に必要なのは
+       * REST APIの方。
+       */
+      restMode:
+        true,
+
+      tokenConfigured:
+        Boolean(
+          KOTOBARU_BOT_TOKEN
+        ),
     });
   }
 );
