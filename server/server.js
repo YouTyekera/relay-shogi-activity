@@ -3595,6 +3595,114 @@ async function showKotobaruSetup(
 }
 
 /* =========================================================
+ * Discord標準の起動カードを出さないための
+ * Entry Point設定
+ *
+ * Discordの標準設定（handler: 2）では、
+ * Activityを起動するとDiscord自身がゲーム招待カードを
+ * チャンネルへ自動投稿します。
+ *
+ * handler: 1（APP_HANDLER）へ変更し、
+ * InteractionCreateで launchActivity() だけを返すことで、
+ * Activityは開きつつフォローアップ投稿は作りません。
+ * ======================================================= */
+
+async function ensureKotobaruEntryPointAppHandler() {
+  if (
+    !KOTOBARU_CLIENT_ID ||
+    !KOTOBARU_BOT_TOKEN
+  ) {
+    console.warn(
+      "ことばルEntry Point設定を確認できません: Client IDまたはBot Tokenがありません"
+    );
+
+    return false;
+  }
+
+  try {
+    const listResponse =
+      await discordRest(
+        `/applications/${KOTOBARU_CLIENT_ID}/commands`
+      );
+
+    if (!listResponse.ok) {
+      console.error(
+        "ことばルEntry Point取得失敗:",
+        listResponse.status,
+        await listResponse
+          .text()
+          .catch(() => "")
+      );
+
+      return false;
+    }
+
+    const commands =
+      await listResponse.json();
+
+    const entryPoint =
+      commands.find(
+        (command) =>
+          command.type === 4
+      );
+
+    if (!entryPoint) {
+      console.error(
+        "ことばルのPRIMARY_ENTRY_POINTコマンドが見つかりませんでした。Discord Developer PortalでActivitiesが有効か確認してください。"
+      );
+
+      return false;
+    }
+
+    if (
+      entryPoint.handler === 1
+    ) {
+      console.log(
+        `ことばルEntry Point確認済み: ${entryPoint.name} / APP_HANDLER`
+      );
+
+      return true;
+    }
+
+    const updateResponse =
+      await discordRest(
+        `/applications/${KOTOBARU_CLIENT_ID}/commands/${entryPoint.id}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            handler: 1,
+          }),
+        }
+      );
+
+    if (!updateResponse.ok) {
+      console.error(
+        "ことばルEntry Point更新失敗:",
+        updateResponse.status,
+        await updateResponse
+          .text()
+          .catch(() => "")
+      );
+
+      return false;
+    }
+
+    console.log(
+      `ことばルEntry PointをAPP_HANDLERへ変更しました: ${entryPoint.name}`
+    );
+
+    return true;
+  } catch (error) {
+    console.error(
+      "ことばルEntry Point設定エラー:",
+      error
+    );
+
+    return false;
+  }
+}
+
+/* =========================================================
  * スラッシュコマンド
  * ======================================================= */
 
@@ -3725,6 +3833,36 @@ kotobaruBot.on(
 kotobaruBot.on(
   Events.InteractionCreate,
   async (interaction) => {
+    /*
+     * PRIMARY_ENTRY_POINT（#起動 / Play now!）
+     *
+     * Discordへ通常メッセージを返信せず、
+     * LAUNCH_ACTIVITYだけを返します。
+     * これによりゲームは開きますが、
+     * 「○○さんが #起動 を使用しました」の
+     * ゲーム招待カードは新規作成されません。
+     */
+    if (
+      typeof interaction.isPrimaryEntryPointCommand ===
+        "function" &&
+      interaction.isPrimaryEntryPointCommand()
+    ) {
+      try {
+        await interaction.launchActivity();
+
+        console.log(
+          `ことばルActivity起動: ${interaction.user?.tag || interaction.user?.username || interaction.user?.id || "unknown"}`
+        );
+      } catch (error) {
+        console.error(
+          "ことばルActivity起動応答エラー:",
+          error
+        );
+      }
+
+      return;
+    }
+
     if (
       !interaction.isChatInputCommand()
     ) {
@@ -4335,9 +4473,9 @@ async function cleanupOldKotobaruLaunchMessages(
         );
 
     /*
-     * Preview側に「Play now!」を置くため、
-     * Entry Pointコマンドが自動生成したゲーム招待カードは
-     * 残しません。
+     * 旧handler設定時に作られたゲーム招待カードの整理用。
+     * 現在はPRIMARY_ENTRY_POINTをAPP_HANDLERにしているため、
+     * 新しい起動カードは原則として生成されません。
      */
     for (
       const oldMessage of
@@ -4489,6 +4627,19 @@ async function startKotobaruBot() {
       console.log(
         `ことばル Bot ready: ${readyClient.user.tag}`
       );
+
+      /*
+       * Discord標準の起動カードを出さない設定。
+       * PRIMARY_ENTRY_POINT を APP_HANDLER に変更します。
+       */
+      try {
+        await ensureKotobaruEntryPointAppHandler();
+      } catch (error) {
+        console.error(
+          "ことばルEntry Point同期処理エラー:",
+          error
+        );
+      }
 
       /*
        * スラッシュコマンド同期
