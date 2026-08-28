@@ -3595,19 +3595,15 @@ async function showKotobaruSetup(
 }
 
 /* =========================================================
- * Discord標準の起動カードを出さないための
- * Entry Point設定
+ * Entry PointをDiscord標準の高速起動へ戻す
  *
- * Discordの標準設定（handler: 2）では、
- * Activityを起動するとDiscord自身がゲーム招待カードを
- * チャンネルへ自動投稿します。
- *
- * handler: 1（APP_HANDLER）へ変更し、
- * InteractionCreateで launchActivity() だけを返すことで、
- * Activityは開きつつフォローアップ投稿は作りません。
+ * handler: 2（DISCORD_LAUNCH_ACTIVITY）では、
+ * Renderが眠っていてもDiscord自身がすぐActivityを開きます。
+ * その代わりDiscordがゲーム招待カードを一時的に投稿するため、
+ * Activity本体が起動してRenderへ到達した時点で後段のcleanupで削除します。
  * ======================================================= */
 
-async function ensureKotobaruEntryPointAppHandler() {
+async function ensureKotobaruEntryPointDiscordHandler() {
   if (
     !KOTOBARU_CLIENT_ID ||
     !KOTOBARU_BOT_TOKEN
@@ -3655,10 +3651,10 @@ async function ensureKotobaruEntryPointAppHandler() {
     }
 
     if (
-      entryPoint.handler === 1
+      entryPoint.handler === 2
     ) {
       console.log(
-        `ことばルEntry Point確認済み: ${entryPoint.name} / APP_HANDLER`
+        `ことばルEntry Point確認済み: ${entryPoint.name} / DISCORD_LAUNCH_ACTIVITY`
       );
 
       return true;
@@ -3670,7 +3666,7 @@ async function ensureKotobaruEntryPointAppHandler() {
         {
           method: "PATCH",
           body: JSON.stringify({
-            handler: 1,
+            handler: 2,
           }),
         }
       );
@@ -3688,7 +3684,7 @@ async function ensureKotobaruEntryPointAppHandler() {
     }
 
     console.log(
-      `ことばルEntry PointをAPP_HANDLERへ変更しました: ${entryPoint.name}`
+      `ことばルEntry PointをDISCORD_LAUNCH_ACTIVITYへ戻しました: ${entryPoint.name}`
     );
 
     return true;
@@ -3833,36 +3829,6 @@ kotobaruBot.on(
 kotobaruBot.on(
   Events.InteractionCreate,
   async (interaction) => {
-    /*
-     * PRIMARY_ENTRY_POINT（#起動 / Play now!）
-     *
-     * Discordへ通常メッセージを返信せず、
-     * LAUNCH_ACTIVITYだけを返します。
-     * これによりゲームは開きますが、
-     * 「○○さんが #起動 を使用しました」の
-     * ゲーム招待カードは新規作成されません。
-     */
-    if (
-      typeof interaction.isPrimaryEntryPointCommand ===
-        "function" &&
-      interaction.isPrimaryEntryPointCommand()
-    ) {
-      try {
-        await interaction.launchActivity();
-
-        console.log(
-          `ことばルActivity起動: ${interaction.user?.tag || interaction.user?.username || interaction.user?.id || "unknown"}`
-        );
-      } catch (error) {
-        console.error(
-          "ことばルActivity起動応答エラー:",
-          error
-        );
-      }
-
-      return;
-    }
-
     if (
       !interaction.isChatInputCommand()
     ) {
@@ -4435,7 +4401,7 @@ async function cleanupOldKotobaruLaunchMessages(
   try {
     const response =
       await discordRest(
-        `/channels/${channelId}/messages?limit=30`
+        `/channels/${channelId}/messages?limit=50`
       );
 
     if (!response.ok) {
@@ -4445,55 +4411,90 @@ async function cleanupOldKotobaruLaunchMessages(
     const messages =
       await response.json();
 
-    /*
-     * DiscordがEntry Point（起動）を実行した際に作る
-     * CHAT_INPUT_COMMAND系のゲーム招待メッセージだけを対象にします。
-     * ことばル自身のPreview投稿（type 0）は削除しません。
-     */
-    const launchMessages =
-      messages
-        .filter(
-          (message) =>
-            message.type === 20 &&
-            (
-              message.application_id ===
-                KOTOBARU_CLIENT_ID ||
-              message.interaction_metadata?.application_id ===
-                KOTOBARU_CLIENT_ID
-            )
-        )
-        .sort(
-          (a, b) =>
-            new Date(
-              b.timestamp
-            ).getTime() -
-            new Date(
-              a.timestamp
-            ).getTime()
-        );
+    const now =
+      Date.now();
 
     /*
-     * 旧handler設定時に作られたゲーム招待カードの整理用。
-     * 現在はPRIMARY_ENTRY_POINTをAPP_HANDLERにしているため、
-     * 新しい起動カードは原則として生成されません。
+     * DISCORD_LAUNCH_ACTIVITY が自動生成した
+     * ことばルのゲーム招待メッセージだけを対象にします。
+     *
+     * Discord側のメッセージ型はクライアント更新で変わる可能性があるため、
+     * type === 20 だけに限定せず、application_id / interaction_metadata も使います。
+     * Botが通常RESTで投稿したPreviewは interaction_metadata を持たないため残ります。
      */
+    const launchMessages =
+      messages.filter(
+        (message) => {
+          const createdAt =
+            new Date(
+              message.timestamp
+            ).getTime();
+
+          const recentEnough =
+            Number.isFinite(
+              createdAt
+            ) &&
+            now - createdAt <=
+              30 * 60 * 1000;
+
+          if (!recentEnough) {
+            return false;
+          }
+
+          const sameApplication =
+            message.application_id ===
+              KOTOBARU_CLIENT_ID ||
+            message.interaction_metadata?.application_id ===
+              KOTOBARU_CLIENT_ID ||
+            message.interaction?.application_id ===
+              KOTOBARU_CLIENT_ID;
+
+          if (!sameApplication) {
+            return false;
+          }
+
+          const interactionGenerated =
+            message.type === 20 ||
+            Boolean(
+              message.interaction_metadata
+            ) ||
+            Boolean(
+              message.interaction
+            );
+
+          return interactionGenerated;
+        }
+      );
+
     for (
-      const oldMessage of
+      const message of
       launchMessages
     ) {
-      await discordRest(
-        `/channels/${channelId}/messages/${oldMessage.id}`,
-        {
-          method:
-            "DELETE",
-        }
-      ).catch(
-        () => null
-      );
+      const deleteResponse =
+        await discordRest(
+          `/channels/${channelId}/messages/${message.id}`,
+          {
+            method: "DELETE",
+          }
+        );
+
+      if (
+        deleteResponse.ok ||
+        deleteResponse.status === 404
+      ) {
+        console.log(
+          `ことばル起動カードを整理しました: ${message.id}`
+        );
+      } else {
+        console.warn(
+          "ことばル起動カード削除失敗:",
+          deleteResponse.status
+        );
+      }
     }
   } catch (error) {
     console.warn(
-      "古い起動メッセージ整理に失敗しました:",
+      "起動メッセージ整理に失敗しました:",
       error
     );
   }
@@ -4536,20 +4537,26 @@ app.post(
       );
 
       /*
-       * Discord側の起動カード作成が少し遅れる場合があるため、
-       * 数秒後にももう一度整理します。
+       * Discordのゲーム招待カードはActivity起動より少し遅れて
+       * チャンネルへ現れる場合があります。
+       * Renderが起きたあと複数回だけ確認し、取りこぼしを防ぎます。
        */
       if (channelId) {
-        setTimeout(
-          () => {
-            cleanupOldKotobaruLaunchMessages(
-              channelId
-            ).catch(
-              () => null
-            );
-          },
-          5000
-        );
+        for (
+          const delay of
+          [3000, 8000, 15000]
+        ) {
+          setTimeout(
+            () => {
+              cleanupOldKotobaruLaunchMessages(
+                channelId
+              ).catch(
+                () => null
+              );
+            },
+            delay
+          );
+        }
       }
 
       return res.json({
@@ -4633,7 +4640,7 @@ async function startKotobaruBot() {
        * PRIMARY_ENTRY_POINT を APP_HANDLER に変更します。
        */
       try {
-        await ensureKotobaruEntryPointAppHandler();
+        await ensureKotobaruEntryPointDiscordHandler();
       } catch (error) {
         console.error(
           "ことばルEntry Point同期処理エラー:",
