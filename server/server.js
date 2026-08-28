@@ -2098,56 +2098,95 @@ async function saveKotobaruLiveSessionMarker(
 
 /* =========================================================
  * Discordアイコン
+ *
+ * Previewでは「サーバー専用アイコン」を最優先します。
+ * それがなければグローバルアイコン、最後に既定アイコンへ
+ * フォールバックします。
  * ======================================================= */
 
-function discordAvatarUrl(
+function discordDefaultAvatarIndex(
   userId,
-  avatarHash
+  discriminator = "0"
+) {
+  if (
+    discriminator &&
+    discriminator !== "0"
+  ) {
+    const number =
+      Number(discriminator);
+
+    if (
+      Number.isFinite(number)
+    ) {
+      return number % 5;
+    }
+  }
+
+  try {
+    return Number(
+      (BigInt(userId) >>
+        22n) %
+        6n
+    );
+  } catch {
+    return 0;
+  }
+}
+
+function discordUserAvatarUrl(
+  userId,
+  avatarHash,
+  discriminator = "0"
 ) {
   if (avatarHash) {
     return `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png?size=128`;
   }
 
-  let index = 0;
-
-  try {
-    index =
-      Number(
-        (BigInt(userId) >>
-          22n) %
-          6n
-      );
-  } catch {
-    index = 0;
-  }
-
-  return `https://cdn.discordapp.com/embed/avatars/${index}.png`;
+  return `https://cdn.discordapp.com/embed/avatars/${discordDefaultAvatarIndex(
+    userId,
+    discriminator
+  )}.png`;
 }
 
-async function getDiscordAvatarDataUri(
+function discordGuildMemberAvatarUrl(
+  guildId,
   userId,
   avatarHash
 ) {
-  const cacheKey =
-    `${userId}:${avatarHash || "default"}`;
+  return `https://cdn.discordapp.com/guilds/${guildId}/users/${userId}/avatars/${avatarHash}.png?size=128`;
+}
 
-  const cached =
-    avatarDataCache.get(
-      cacheKey
-    );
-
-  if (cached) {
-    return cached;
-  }
-
+async function getDiscordGuildMemberProfile(
+  guildId,
+  userId
+) {
   try {
     const response =
-      await fetch(
-        discordAvatarUrl(
-          userId,
-          avatarHash
-        )
+      await discordRest(
+        `/guilds/${guildId}/members/${userId}`
       );
+
+    if (!response.ok) {
+      return null;
+    }
+
+    return await response.json();
+  } catch (error) {
+    console.warn(
+      "Discordメンバー情報取得失敗:",
+      error
+    );
+
+    return null;
+  }
+}
+
+async function fetchImageAsDataUri(
+  url
+) {
+  try {
+    const response =
+      await fetch(url);
 
     if (!response.ok) {
       return null;
@@ -2163,25 +2202,107 @@ async function getDiscordAvatarDataUri(
         "content-type"
       ) || "image/png";
 
-    const dataUri =
-      `data:${contentType};base64,${bytes.toString(
-        "base64"
-      )}`;
-
-    avatarDataCache.set(
-      cacheKey,
-      dataUri
-    );
-
-    return dataUri;
+    return `data:${contentType};base64,${bytes.toString(
+      "base64"
+    )}`;
   } catch (error) {
     console.warn(
-      "Discordアイコン取得失敗:",
+      "Discordアイコン画像取得失敗:",
       error
     );
 
     return null;
   }
+}
+
+async function getDiscordPreviewProfile(
+  guildId,
+  entry
+) {
+  const cacheKey =
+    `${guildId}:${entry.userId}:${entry.avatarHash || "default"}`;
+
+  const cached =
+    avatarDataCache.get(
+      cacheKey
+    );
+
+  if (cached) {
+    return cached;
+  }
+
+  const member =
+    await getDiscordGuildMemberProfile(
+      guildId,
+      entry.userId
+    );
+
+  const memberAvatarHash =
+    member?.avatar ||
+    null;
+
+  const globalAvatarHash =
+    member?.user?.avatar ||
+    entry.avatarHash ||
+    null;
+
+  const discriminator =
+    member?.user?.discriminator ||
+    "0";
+
+  const avatarUrl =
+    memberAvatarHash
+      ? discordGuildMemberAvatarUrl(
+          guildId,
+          entry.userId,
+          memberAvatarHash
+        )
+      : discordUserAvatarUrl(
+          entry.userId,
+          globalAvatarHash,
+          discriminator
+        );
+
+  let avatarDataUri =
+    await fetchImageAsDataUri(
+      avatarUrl
+    );
+
+  /*
+   * サーバー専用アイコンの取得だけ失敗した場合は
+   * グローバルアイコンでもう一度試します。
+   */
+  if (
+    !avatarDataUri &&
+    memberAvatarHash
+  ) {
+    avatarDataUri =
+      await fetchImageAsDataUri(
+        discordUserAvatarUrl(
+          entry.userId,
+          globalAvatarHash,
+          discriminator
+        )
+      );
+  }
+
+  const profile = {
+    avatarDataUri,
+
+    displayName:
+      member?.nick ||
+      member?.user?.global_name ||
+      entry.displayName ||
+      member?.user?.username ||
+      "挑戦者",
+  };
+
+  avatarDataCache.set(
+    cacheKey,
+    profile
+  );
+
+  return profile;
 }
 
 /* =========================================================
@@ -2370,6 +2491,25 @@ function countKotobaruStatus(
   };
 }
 
+function activityLinkButton(
+  label = "Play now!"
+) {
+  return [
+    {
+      type: 1,
+      components: [
+        {
+          type: 2,
+          style: 5,
+          label,
+          url:
+            `https://discord.com/activities/${KOTOBARU_CLIENT_ID}`,
+        },
+      ],
+    },
+  ];
+}
+
 function buildKotobaruLiveCardPayload(
   entries,
   puzzleNumber,
@@ -2391,8 +2531,6 @@ function buildKotobaruLiveCardPayload(
     finishedCount > 0
       ? `${finishedCount}人がこの時間帯の挑戦を終えました。`
       : null,
-
-    "答えの文字は伏せたまま、色の並びだけを表示しています。",
   ]
     .filter(Boolean)
     .join(
@@ -2432,6 +2570,11 @@ function buildKotobaruLiveCardPayload(
       },
     ],
 
+    components:
+      activityLinkButton(
+        "Play now!"
+      ),
+
     ...(silent
       ? {
           flags:
@@ -2442,18 +2585,26 @@ function buildKotobaruLiveCardPayload(
 }
 
 async function enrichKotobaruEntriesWithAvatars(
-  entries
+  entries,
+  guildId
 ) {
   return Promise.all(
     entries.map(
-      async (entry) => ({
-        ...entry,
-        avatarDataUri:
-          await getDiscordAvatarDataUri(
-            entry.userId,
-            entry.avatarHash
-          ),
-      })
+      async (entry) => {
+        const profile =
+          await getDiscordPreviewProfile(
+            guildId,
+            entry
+          );
+
+        return {
+          ...entry,
+          displayName:
+            profile.displayName,
+          avatarDataUri:
+            profile.avatarDataUri,
+        };
+      }
     )
   );
 }
@@ -2463,10 +2614,7 @@ function buildKotobaruPreviewSvg(
   puzzleNumber
 ) {
   const previewEntries =
-    entries.slice(
-      0,
-      6
-    );
+    entries;
 
   const width = 960;
   const columnCount =
@@ -2486,9 +2634,9 @@ function buildKotobaruPreviewSvg(
       )
     );
   const height =
-    rowCount === 1
-      ? 560
-      : 930;
+    105 +
+    rowCount * 388 +
+    70;
   const panelWidth = 240;
   const panelHeight = 360;
   const panelGapX = 28;
@@ -2656,27 +2804,23 @@ function buildKotobaruPreviewSvg(
       </g>`;
   }
 
-  const overflowText =
-    entries.length > 6
-      ? `<text x="480" y="${height - 24}" text-anchor="middle" font-family="Source Han Sans HW" font-size="18" fill="#d7dadc">ほか${entries.length - 6}人</text>`
-      : "";
-
   return `
   <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" fill="none" xmlns="http://www.w3.org/2000/svg">
     <rect width="${width}" height="${height}" fill="#121213" />
     <text x="480" y="58" text-anchor="middle" font-family="Source Han Sans HW" font-size="30" font-weight="700" fill="#ffffff">ことばル 第${puzzleNumber}問</text>
     ${cards}
-    ${overflowText}
   </svg>`;
 }
 
 async function renderKotobaruPreviewPng(
   entries,
-  puzzleNumber
+  puzzleNumber,
+  guildId
 ) {
   const enriched =
     await enrichKotobaruEntriesWithAvatars(
-      entries
+      entries,
+      guildId
     );
 
   const svg =
@@ -2765,7 +2909,8 @@ async function upsertKotobaruLiveCard(
   const previewPng =
     await renderKotobaruPreviewPng(
       entries,
-      puzzleNumber
+      puzzleNumber,
+      guildId
     );
 
   const files = [
@@ -2899,13 +3044,25 @@ async function postKotobaruSummaryForGuild(
             : 1;
         }
 
-        if (!a.won) {
-          return 0;
+        if (
+          a.won &&
+          b.won &&
+          a.attempts !==
+            b.attempts
+        ) {
+          return (
+            a.attempts -
+            b.attempts
+          );
         }
 
         return (
-          a.attempts -
-          b.attempts
+          new Date(
+            a.savedAt || 0
+          ).getTime() -
+          new Date(
+            b.savedAt || 0
+          ).getTime()
         );
       }
     );
@@ -2921,7 +3078,8 @@ async function postKotobaruSummaryForGuild(
   const previewPng =
     await renderKotobaruPreviewPng(
       entries,
-      puzzleNumber
+      puzzleNumber,
+      guildId
     );
 
   const payload = {
@@ -2957,6 +3115,11 @@ async function postKotobaruSummaryForGuild(
           "ことばルの昨日の結果プレビュー",
       },
     ],
+
+    components:
+      activityLinkButton(
+        "Play now!"
+      ),
 
     flags:
       SUPPRESS_NOTIFICATIONS_FLAG,
@@ -4172,12 +4335,13 @@ async function cleanupOldKotobaruLaunchMessages(
         );
 
     /*
-     * 最新1件だけ残すことで、起動するたびに招待カードが
-     * 積み上がる状態を防ぎます。
+     * Preview側に「Play now!」を置くため、
+     * Entry Pointコマンドが自動生成したゲーム招待カードは
+     * 残しません。
      */
     for (
       const oldMessage of
-      launchMessages.slice(1)
+      launchMessages
     ) {
       await discordRest(
         `/channels/${channelId}/messages/${oldMessage.id}`,
@@ -4232,6 +4396,23 @@ app.post(
       await cleanupOldKotobaruLaunchMessages(
         channelId
       );
+
+      /*
+       * Discord側の起動カード作成が少し遅れる場合があるため、
+       * 数秒後にももう一度整理します。
+       */
+      if (channelId) {
+        setTimeout(
+          () => {
+            cleanupOldKotobaruLaunchMessages(
+              channelId
+            ).catch(
+              () => null
+            );
+          },
+          5000
+        );
+      }
 
       return res.json({
         ok: true,
