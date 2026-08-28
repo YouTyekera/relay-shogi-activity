@@ -6,6 +6,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { Server } from "socket.io";
 import cron from "node-cron";
+import { Resvg } from "@resvg/resvg-js";
 
 import {
   ChannelType,
@@ -148,6 +149,101 @@ async function discordRest(
     return discordRest(
       endpoint,
       options,
+      attempt + 1
+    );
+  }
+
+  return response;
+}
+
+async function discordRestMultipart(
+  endpoint,
+  method,
+  payload,
+  files = [],
+  attempt = 1
+) {
+  if (
+    !KOTOBARU_BOT_TOKEN
+  ) {
+    throw new Error(
+      "KOTOBARU_DISCORD_TOKEN がありません"
+    );
+  }
+
+  const form =
+    new FormData();
+
+  form.append(
+    "payload_json",
+    JSON.stringify(payload)
+  );
+
+  files.forEach(
+    (file, index) => {
+      form.append(
+        `files[${index}]`,
+        new Blob(
+          [file.data],
+          {
+            type:
+              file.contentType ||
+              "application/octet-stream",
+          }
+        ),
+        file.name
+      );
+    }
+  );
+
+  const response =
+    await fetch(
+      `${DISCORD_API}${endpoint}`,
+      {
+        method,
+        headers: {
+          Authorization:
+            `Bot ${KOTOBARU_BOT_TOKEN}`,
+        },
+        body: form,
+      }
+    );
+
+  if (
+    response.status ===
+      429 &&
+    attempt <= 5
+  ) {
+    let retryAfter = 2;
+
+    try {
+      const data =
+        await response.json();
+
+      retryAfter =
+        Number(
+          data.retry_after
+        ) || 2;
+    } catch {
+      // JSONでなくても2秒待つ
+    }
+
+    console.warn(
+      `Discord REST Rate Limit。${retryAfter}秒待って再試行します。`
+    );
+
+    await wait(
+      Math.ceil(
+        retryAfter *
+          1000
+      )
+    );
+
+    return discordRestMultipart(
+      endpoint,
+      method,
+      payload,
+      files,
       attempt + 1
     );
   }
@@ -1471,37 +1567,57 @@ function getKotobaruLiveProgress(
  * 「今日の挑戦」公開カード
  * ======================================================= */
 
-function activityLinkButton(
-  label = "すぐ遊ぶ"
+function emojiColor(
+  emoji
 ) {
-  return [
-    {
-      type: 1,
-      components: [
-        {
-          type: 2,
-          style: 5,
-          label,
-          url:
-            `https://discord.com/activities/${KOTOBARU_CLIENT_ID}`,
-        },
-      ],
-    },
-  ];
+  if (emoji === "🟩") {
+    return "#4aa340";
+  }
+
+  if (emoji === "🟨") {
+    return "#d5b222";
+  }
+
+  if (emoji === "🟪") {
+    return "#9057a3";
+  }
+
+  return "#686868";
 }
 
-function buildKotobaruLiveCardPayload(
+function escapeXml(
+  value = ""
+) {
+  return String(value)
+    .replaceAll(
+      "&",
+      "&amp;"
+    )
+    .replaceAll(
+      "<",
+      "&lt;"
+    )
+    .replaceAll(
+      ">",
+      "&gt;"
+    )
+    .replaceAll(
+      '\"',
+      "&quot;"
+    )
+    .replaceAll(
+      "'",
+      "&#39;"
+    );
+}
+
+function buildKotobaruLiveEntries(
   records,
-  liveProgress,
-  puzzleNumber,
-  date
+  liveProgress
 ) {
   const byUser =
     new Map();
 
-  /*
-   * まず途中経過を入れる。
-   */
   for (
     const progress of
     liveProgress
@@ -1512,9 +1628,6 @@ function buildKotobaruLiveCardPayload(
     );
   }
 
-  /*
-   * 終了済み記録がある場合はそちらを優先。
-   */
   for (
     const record of
     records
@@ -1528,96 +1641,70 @@ function buildKotobaruLiveCardPayload(
     );
   }
 
-  const entries =
-    [
-      ...byUser.values(),
-    ].sort(
-      (a, b) => {
-        if (
-          Boolean(a.finished) !==
-          Boolean(b.finished)
-        ) {
-          return a.finished
-            ? 1
-            : -1;
-        }
-
-        if (
-          a.finished &&
-          b.finished
-        ) {
-          if (
-            a.won !==
-            b.won
-          ) {
-            return a.won
-              ? -1
-              : 1;
-          }
-
-          if (
-            a.won &&
-            b.won
-          ) {
-            return (
-              a.attempts -
-              b.attempts
-            );
-          }
-        }
-
-        return (
-          b.pattern.length -
-          a.pattern.length
-        );
+  return [
+    ...byUser.values(),
+  ].sort(
+    (a, b) => {
+      if (
+        Boolean(a.finished) !==
+        Boolean(b.finished)
+      ) {
+        return a.finished
+          ? 1
+          : -1;
       }
-    );
 
-  const fields =
-    entries
-      .slice(
-        0,
-        20
-      )
-      .map(
-        (entry) => {
-          let status;
-
-          if (
-            !entry.finished
-          ) {
-            status =
-              `${entry.pattern.length}/6　挑戦中`;
-          } else if (
-            entry.won
-          ) {
-            status =
-              `${entry.attempts}/6`;
-          } else {
-            status =
-              "×/6";
-          }
-
-          return {
-            name:
-              `${
-                entry.finished
-                  ? entry.won
-                    ? "✓ "
-                    : ""
-                  : "✏️ "
-              }${entry.displayName}　${status}`,
-
-            value:
-              entry.pattern.join(
-                "\n"
-              ),
-
-            inline: true,
-          };
+      if (
+        a.finished &&
+        b.finished
+      ) {
+        if (
+          a.won !==
+          b.won
+        ) {
+          return a.won
+            ? -1
+            : 1;
         }
-      );
 
+        if (
+          a.won &&
+          b.won
+        ) {
+          return (
+            a.attempts -
+            b.attempts
+          );
+        }
+      }
+
+      return (
+        b.pattern.length -
+        a.pattern.length
+      );
+    }
+  );
+}
+
+function kotobaruStatusText(
+  entry
+) {
+  if (
+    !entry.finished
+  ) {
+    return `${entry.pattern.length}/6 挑戦中`;
+  }
+
+  if (entry.won) {
+    return `${entry.attempts}/6`;
+  }
+
+  return "×/6";
+}
+
+function countKotobaruStatus(
+  entries
+) {
   const activeCount =
     entries.filter(
       (entry) =>
@@ -1629,6 +1716,24 @@ function buildKotobaruLiveCardPayload(
       (entry) =>
         entry.finished
     ).length;
+
+  return {
+    activeCount,
+    finishedCount,
+  };
+}
+
+function buildKotobaruLiveCardPayload(
+  entries,
+  puzzleNumber,
+  date
+) {
+  const {
+    activeCount,
+    finishedCount,
+  } = countKotobaruStatus(
+    entries
+  );
 
   const description = [
     activeCount > 0
@@ -1660,32 +1765,195 @@ function buildKotobaruLiveCardPayload(
         color:
           0x4aa340,
 
-        fields:
-          fields.length
-            ? fields
-            : [
-                {
-                  name:
-                    "まだ挑戦者はいません",
-                  value:
-                    "最初の挑戦者になりましょう。",
-                  inline:
-                    false,
-                },
-              ],
+        image: {
+          url:
+            "attachment://preview.png",
+        },
 
         footer: {
-          text:
-            date,
+          text: date,
         },
       },
     ],
 
-    components:
-      activityLinkButton(
-        "すぐ遊ぶ"
-      ),
+    attachments: [
+      {
+        id: 0,
+        filename:
+          "preview.png",
+        description:
+          "ことばルの進行状況プレビュー",
+      },
+    ],
   };
+}
+
+function buildKotobaruPreviewSvg(
+  entries,
+  puzzleNumber
+) {
+  const previewEntries =
+    entries.slice(
+      0,
+      3
+    );
+
+  const width = 960;
+  const height = 540;
+  const panelWidth = 230;
+  const panelHeight = 340;
+  const panelGap = 28;
+  const tileSize = 28;
+  const tileGap = 5;
+  const gridWidth =
+    tileSize * 5 +
+    tileGap * 4;
+  const gridHeight =
+    tileSize * 6 +
+    tileGap * 5;
+  const totalWidth =
+    previewEntries.length > 0
+      ? previewEntries.length *
+          panelWidth +
+        (previewEntries.length -
+          1) *
+          panelGap
+      : panelWidth;
+  const startX =
+    Math.round(
+      (width - totalWidth) / 2
+    );
+
+  let cards = "";
+
+  previewEntries.forEach(
+    (entry, index) => {
+      const x =
+        startX +
+        index *
+          (panelWidth +
+            panelGap);
+      const y = 110;
+      const safeName =
+        escapeXml(
+          entry.displayName.length >
+            14
+            ? `${entry.displayName.slice(0, 14)}…`
+            : entry.displayName
+        );
+      const safeStatus =
+        escapeXml(
+          kotobaruStatusText(
+            entry
+          )
+        );
+      const marker =
+        entry.finished
+          ? entry.won
+            ? "✓"
+            : "×"
+          : "…";
+
+      let tiles = "";
+      for (
+        let row = 0;
+        row < 6;
+        row += 1
+      ) {
+        const rowText =
+          entry.pattern[row] ||
+          "";
+        const chars =
+          Array.from(
+            rowText
+          );
+
+        for (
+          let col = 0;
+          col < 5;
+          col += 1
+        ) {
+          const tx =
+            x +
+            Math.round(
+              (panelWidth -
+                gridWidth) /
+                2
+            ) +
+            col *
+              (tileSize +
+                tileGap);
+          const ty =
+            y + 104 +
+            row *
+              (tileSize +
+                tileGap);
+          const emoji =
+            chars[col];
+          const fill = emoji
+            ? emojiColor(
+                emoji
+              )
+            : "#121213";
+          const stroke = emoji
+            ? fill
+            : "#3a3a3c";
+
+          tiles += `
+            <rect x="${tx}" y="${ty}" width="${tileSize}" height="${tileSize}" rx="2" fill="${fill}" stroke="${stroke}" stroke-width="2" />`;
+        }
+      }
+
+      cards += `
+        <g>
+          <rect x="${x}" y="${y}" width="${panelWidth}" height="${panelHeight}" rx="24" fill="#121213" stroke="#3a3a3c" stroke-width="2" />
+          <text x="${x + panelWidth / 2}" y="${y + 42}" text-anchor="middle" font-size="26" font-weight="700" fill="#ffffff">${safeName}</text>
+          <text x="${x + panelWidth / 2}" y="${y + 72}" text-anchor="middle" font-size="18" font-weight="600" fill="#d7dadc">${escapeXml(marker)} ${safeStatus}</text>
+          ${tiles}
+        </g>`;
+    }
+  );
+
+  if (
+    previewEntries.length === 0
+  ) {
+    cards = `
+      <g>
+        <rect x="${(width - panelWidth) / 2}" y="110" width="${panelWidth}" height="${panelHeight}" rx="24" fill="#121213" stroke="#3a3a3c" stroke-width="2" />
+        <text x="${width / 2}" y="240" text-anchor="middle" font-size="28" font-weight="700" fill="#ffffff">まだ挑戦者はいません</text>
+        <text x="${width / 2}" y="280" text-anchor="middle" font-size="20" fill="#d7dadc">最初の挑戦者になりましょう</text>
+      </g>`;
+  }
+
+  return `
+  <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect width="${width}" height="${height}" fill="#121213" />
+    <text x="${width / 2}" y="55" text-anchor="middle" font-size="28" font-weight="700" fill="#ffffff">ことばル 第${puzzleNumber}問</text>
+    ${cards}
+  </svg>`;
+}
+
+function renderKotobaruPreviewPng(
+  entries,
+  puzzleNumber
+) {
+  const svg =
+    buildKotobaruPreviewSvg(
+      entries,
+      puzzleNumber
+    );
+
+  const resvg =
+    new Resvg(svg, {
+      fitTo: {
+        mode: "width",
+        value: 960,
+      },
+    });
+
+  return resvg
+    .render()
+    .asPng();
 }
 
 async function findKotobaruLiveCardMessageId(
@@ -1796,13 +2064,33 @@ async function upsertKotobaruLiveCard(
       date
     );
 
+  const entries =
+    buildKotobaruLiveEntries(
+      records,
+      liveProgress
+    );
+
   const payload =
     buildKotobaruLiveCardPayload(
-      records,
-      liveProgress,
+      entries,
       puzzleNumber,
       date
     );
+
+  const previewPng =
+    renderKotobaruPreviewPng(
+      entries,
+      puzzleNumber
+    );
+
+  const files = [
+    {
+      name: "preview.png",
+      data: previewPng,
+      contentType:
+        "image/png",
+    },
+  ];
 
   const existingId =
     await findKotobaruLiveCardMessageId(
@@ -1812,17 +2100,11 @@ async function upsertKotobaruLiveCard(
 
   if (existingId) {
     const editResponse =
-      await discordRest(
+      await discordRestMultipart(
         `/channels/${config.summaryChannelId}/messages/${existingId}`,
-        {
-          method:
-            "PATCH",
-
-          body:
-            JSON.stringify(
-              payload
-            ),
-        }
+        "PATCH",
+        payload,
+        files
       );
 
     if (
@@ -1838,17 +2120,11 @@ async function upsertKotobaruLiveCard(
   }
 
   const createResponse =
-    await discordRest(
+    await discordRestMultipart(
       `/channels/${config.summaryChannelId}/messages`,
-      {
-        method:
-          "POST",
-
-        body:
-          JSON.stringify(
-            payload
-          ),
-      }
+      "POST",
+      payload,
+      files
     );
 
   if (!createResponse.ok) {
@@ -1877,6 +2153,8 @@ async function upsertKotobaruLiveCard(
   return true;
 }
 
+/* =========================================================
+ * 昨日の結果投稿
 /* =========================================================
  * 昨日の結果投稿
  * ======================================================= */
