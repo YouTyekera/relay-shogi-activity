@@ -4,6 +4,7 @@ import express from "express";
 import http from "http";
 import path from "path";
 import fs from "fs";
+import crypto from "node:crypto";
 import { fileURLToPath } from "url";
 import { Server } from "socket.io";
 import cron from "node-cron";
@@ -56,6 +57,10 @@ const KOTOBARU_CLIENT_SECRET =
 
 const KOTOBARU_BOT_TOKEN =
   process.env.KOTOBARU_DISCORD_TOKEN?.trim();
+
+const KOTOBARU_LOG_ENCRYPTION_KEY =
+  process.env.KOTOBARU_LOG_ENCRYPTION_KEY?.trim() ||
+  "";
 
 /* =========================================================
  * Discord REST API
@@ -824,6 +829,9 @@ const kotobaruBot =
 const RECORD_PREFIX =
   "KOTOBARU_RECORD:";
 
+const PROGRESS_PREFIX =
+  "KOTOBARU_PROGRESS:";
+
 const SUMMARY_MARKER_PREFIX =
   "KOTOBARU_SUMMARY_POSTED:";
 
@@ -863,6 +871,13 @@ const liveSessionCache =
   new Map();
 
 const finishedRecordsCache =
+  new Map();
+
+/*
+ * 1ユーザー・1日につき1件の暗号化LOGメッセージ。
+ * Render再起動時はDiscordログから再探索します。
+ */
+const progressLogMessageIds =
   new Map();
 
 /*
@@ -936,6 +951,194 @@ function previousJstDateKey() {
         12
       )
     )
+  );
+}
+
+/* =========================================================
+ * 回答単語の暗号化
+ *
+ * DiscordのLOGには平文を残さず、翌日の集計時だけ復号します。
+ * KOTOBARU_LOG_ENCRYPTION_KEY は32byteのBase64を想定します。
+ * ======================================================= */
+
+function getKotobaruEncryptionKey() {
+  if (!KOTOBARU_LOG_ENCRYPTION_KEY) {
+    return null;
+  }
+
+  try {
+    const key =
+      Buffer.from(
+        KOTOBARU_LOG_ENCRYPTION_KEY,
+        "base64"
+      );
+
+    return key.length === 32
+      ? key
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function encryptKotobaruGuesses(
+  guesses
+) {
+  if (
+    !Array.isArray(guesses) ||
+    guesses.length === 0
+  ) {
+    return null;
+  }
+
+  const key =
+    getKotobaruEncryptionKey();
+
+  if (!key) {
+    console.warn(
+      "KOTOBARU_LOG_ENCRYPTION_KEY が未設定または不正なため、回答単語はLOGへ保存しません。"
+    );
+
+    return null;
+  }
+
+  const iv =
+    crypto.randomBytes(12);
+
+  const cipher =
+    crypto.createCipheriv(
+      "aes-256-gcm",
+      key,
+      iv
+    );
+
+  const plain =
+    JSON.stringify(guesses);
+
+  const encrypted =
+    Buffer.concat([
+      cipher.update(
+        plain,
+        "utf8"
+      ),
+      cipher.final(),
+    ]);
+
+  const tag =
+    cipher.getAuthTag();
+
+  return {
+    version: 1,
+    algorithm:
+      "aes-256-gcm",
+    iv:
+      iv.toString("base64"),
+    tag:
+      tag.toString("base64"),
+    data:
+      encrypted.toString("base64"),
+  };
+}
+
+function decryptKotobaruGuesses(
+  encrypted
+) {
+  if (
+    !encrypted ||
+    encrypted.version !== 1 ||
+    encrypted.algorithm !==
+      "aes-256-gcm"
+  ) {
+    return null;
+  }
+
+  const key =
+    getKotobaruEncryptionKey();
+
+  if (!key) {
+    return null;
+  }
+
+  try {
+    const decipher =
+      crypto.createDecipheriv(
+        "aes-256-gcm",
+        key,
+        Buffer.from(
+          encrypted.iv,
+          "base64"
+        )
+      );
+
+    decipher.setAuthTag(
+      Buffer.from(
+        encrypted.tag,
+        "base64"
+      )
+    );
+
+    const plain =
+      Buffer.concat([
+        decipher.update(
+          Buffer.from(
+            encrypted.data,
+            "base64"
+          )
+        ),
+        decipher.final(),
+      ]).toString("utf8");
+
+    const guesses =
+      JSON.parse(plain);
+
+    return Array.isArray(guesses)
+      ? guesses.filter(
+          (guess) =>
+            typeof guess ===
+              "string"
+        )
+      : null;
+  } catch (error) {
+    console.warn(
+      "ことばル回答単語の復号に失敗しました:",
+      error?.message || error
+    );
+
+    return null;
+  }
+}
+
+function validateOptionalGuesses(
+  body
+) {
+  if (
+    body.guesses ===
+      undefined
+  ) {
+    /*
+     * 旧バージョンのActivityとも互換性を保ちます。
+     */
+    return true;
+  }
+
+  if (
+    !Array.isArray(
+      body.guesses
+    ) ||
+    body.guesses.length < 1 ||
+    body.guesses.length > 6 ||
+    body.guesses.length !==
+      body.pattern.length
+  ) {
+    return false;
+  }
+
+  return body.guesses.every(
+    (guess) =>
+      typeof guess ===
+        "string" &&
+      Array.from(guess).length >= 1 &&
+      Array.from(guess).length <= 20
   );
 }
 
@@ -1021,13 +1224,18 @@ function validateKotobaruResult(
     return false;
   }
 
-  return body.pattern.every(
-    (row) =>
-      typeof row ===
-        "string" &&
-      /^[🟩🟨🟪⬛]{5}$/u.test(
-        row
-      )
+  return (
+    body.pattern.every(
+      (row) =>
+        typeof row ===
+          "string" &&
+        /^[🟩🟨🟪⬛]{5}$/u.test(
+          row
+        )
+    ) &&
+    validateOptionalGuesses(
+      body
+    )
   );
 }
 
@@ -1105,13 +1313,18 @@ function validateKotobaruProgress(
     return false;
   }
 
-  return body.pattern.every(
-    (row) =>
-      typeof row ===
-        "string" &&
-      /^[🟩🟨🟪⬛]{5}$/u.test(
-        row
-      )
+  return (
+    body.pattern.every(
+      (row) =>
+        typeof row ===
+          "string" &&
+        /^[🟩🟨🟪⬛]{5}$/u.test(
+          row
+        )
+    ) &&
+    validateOptionalGuesses(
+      body
+    )
   );
 }
 
@@ -1499,7 +1712,7 @@ async function fetchRecentKotobaruMessagesRest(
  * 指定日の終了済み結果を読む
  * ======================================================= */
 
-async function loadKotobaruResultsForDate(
+async function loadKotobaruParticipantsForDate(
   guildId,
   date
 ) {
@@ -1521,6 +1734,61 @@ async function loadKotobaruResultsForDate(
   const byUser =
     new Map();
 
+  /*
+   * 新形式：1ユーザー1日1メッセージ。
+   * 編集によって最新状態が入っているので、これを最優先します。
+   */
+  for (
+    const message of
+    messages
+  ) {
+    if (
+      !message.author?.bot ||
+      typeof message.content !==
+        "string" ||
+      !message.content.startsWith(
+        PROGRESS_PREFIX
+      )
+    ) {
+      continue;
+    }
+
+    try {
+      const record =
+        JSON.parse(
+          message.content.slice(
+            PROGRESS_PREFIX.length
+          )
+        );
+
+      if (
+        record.guildId !==
+          guildId ||
+        record.date !==
+          date ||
+        typeof record.userId !==
+          "string"
+      ) {
+        continue;
+      }
+
+      byUser.set(
+        record.userId,
+        {
+          ...record,
+          logMessageId:
+            message.id,
+        }
+      );
+    } catch {
+      // 壊れた進捗記録は無視
+    }
+  }
+
+  /*
+   * 旧形式 RECORD は後方互換用。
+   * 新形式がない人だけ読み込みます。
+   */
   for (
     const message of
     messages
@@ -1548,33 +1816,258 @@ async function loadKotobaruResultsForDate(
         record.guildId !==
           guildId ||
         record.date !==
-          date
+          date ||
+        byUser.has(
+          record.userId
+        )
       ) {
         continue;
       }
 
-      /*
-       * Discordは新しいメッセージから返すので、
-       * 最初に見つけたものがその人の最新結果。
-       */
-      if (
-        !byUser.has(
-          record.userId
-        )
-      ) {
-        byUser.set(
-          record.userId,
-          record
-        );
-      }
+      byUser.set(
+        record.userId,
+        {
+          ...record,
+          finished: true,
+        }
+      );
     } catch {
-      // 壊れた記録は無視
+      // 壊れた旧記録は無視
     }
   }
 
   return [
     ...byUser.values(),
   ];
+}
+
+async function loadKotobaruResultsForDate(
+  guildId,
+  date
+) {
+  const participants =
+    await loadKotobaruParticipantsForDate(
+      guildId,
+      date
+    );
+
+  return participants.filter(
+    (record) =>
+      record.finished === true
+  );
+}
+
+/* =========================================================
+ * 暗号化した途中経過LOGを1ユーザー1日1件で更新
+ * ======================================================= */
+
+function progressLogCacheKey(
+  guildId,
+  date,
+  userId
+) {
+  return `${guildId}:${date}:${userId}`;
+}
+
+async function findKotobaruProgressLogMessageId(
+  config,
+  guildId,
+  date,
+  userId
+) {
+  const key =
+    progressLogCacheKey(
+      guildId,
+      date,
+      userId
+    );
+
+  const cached =
+    progressLogMessageIds.get(
+      key
+    );
+
+  if (cached) {
+    return cached;
+  }
+
+  const messages =
+    await fetchRecentKotobaruMessagesRest(
+      config.logChannelId,
+      1000
+    );
+
+  for (
+    const message of
+    messages
+  ) {
+    if (
+      !message.author?.bot ||
+      typeof message.content !==
+        "string" ||
+      !message.content.startsWith(
+        PROGRESS_PREFIX
+      )
+    ) {
+      continue;
+    }
+
+    try {
+      const record =
+        JSON.parse(
+          message.content.slice(
+            PROGRESS_PREFIX.length
+          )
+        );
+
+      if (
+        record.guildId ===
+          guildId &&
+        record.date ===
+          date &&
+        record.userId ===
+          userId
+      ) {
+        progressLogMessageIds.set(
+          key,
+          message.id
+        );
+
+        return message.id;
+      }
+    } catch {
+      // 壊れたメッセージは無視
+    }
+  }
+
+  return null;
+}
+
+async function upsertKotobaruProgressLog(
+  config,
+  record,
+  guesses
+) {
+  const encrypted =
+    encryptKotobaruGuesses(
+      guesses
+    );
+
+  const safeRecord = {
+    guildId:
+      record.guildId,
+    userId:
+      record.userId,
+    displayName:
+      record.displayName,
+    avatarHash:
+      record.avatarHash ??
+      null,
+    sessionId:
+      record.sessionId ??
+      null,
+    puzzleNumber:
+      record.puzzleNumber,
+    date:
+      record.date,
+    attempts:
+      record.attempts,
+    won:
+      Boolean(
+        record.won
+      ),
+    finished:
+      Boolean(
+        record.finished
+      ),
+    pattern:
+      record.pattern,
+    guessesEncrypted:
+      encrypted,
+    updatedAt:
+      new Date()
+        .toISOString(),
+    ...(record.finished
+      ? {
+          savedAt:
+            record.savedAt ||
+            new Date()
+              .toISOString(),
+        }
+      : {}),
+  };
+
+  const content =
+    `${PROGRESS_PREFIX}${JSON.stringify(
+      safeRecord
+    )}`;
+
+  const existingId =
+    await findKotobaruProgressLogMessageId(
+      config,
+      record.guildId,
+      record.date,
+      record.userId
+    );
+
+  if (existingId) {
+    const response =
+      await discordRest(
+        `/channels/${config.logChannelId}/messages/${existingId}`,
+        {
+          method:
+            "PATCH",
+          body:
+            JSON.stringify({
+              content,
+            }),
+        }
+      );
+
+    if (response.ok) {
+      return existingId;
+    }
+
+    console.warn(
+      "ことばル進捗LOG更新失敗。新規作成へ切り替えます:",
+      response.status
+    );
+  }
+
+  const response =
+    await discordRest(
+      `/channels/${config.logChannelId}/messages`,
+      {
+        method:
+          "POST",
+        body:
+          JSON.stringify({
+            content,
+            flags:
+              SUPPRESS_NOTIFICATIONS_FLAG,
+          }),
+      }
+    );
+
+  if (!response.ok) {
+    throw new Error(
+      `ことばル進捗LOG保存失敗: HTTP ${response.status}`
+    );
+  }
+
+  const created =
+    await response.json();
+
+  progressLogMessageIds.set(
+    progressLogCacheKey(
+      record.guildId,
+      record.date,
+      record.userId
+    ),
+    created.id
+  );
+
+  return created.id;
 }
 
 /* =========================================================
@@ -2472,7 +2965,9 @@ function kotobaruStatusText(
   if (
     !entry.finished
   ) {
-    return `${entry.pattern.length}/6 挑戦中`;
+    return entry.historical
+      ? `${entry.pattern.length}手`
+      : `${entry.pattern.length}/6 挑戦中`;
   }
 
   if (entry.won) {
@@ -2618,6 +3113,28 @@ async function enrichKotobaruEntriesWithAvatars(
   );
 }
 
+function previewColumnCount(
+  count
+) {
+  if (count <= 1) {
+    return 1;
+  }
+
+  if (count <= 5) {
+    return count;
+  }
+
+  if (count <= 6) {
+    return 3;
+  }
+
+  if (count <= 8) {
+    return 4;
+  }
+
+  return 5;
+}
+
 function buildKotobaruPreviewSvg(
   entries,
   puzzleNumber
@@ -2625,12 +3142,10 @@ function buildKotobaruPreviewSvg(
   const previewEntries =
     entries;
 
-  const width = 960;
   const columnCount =
-    Math.max(
-      1,
-      Math.min(
-        3,
+    previewColumnCount(
+      Math.max(
+        1,
         previewEntries.length
       )
     );
@@ -2639,34 +3154,39 @@ function buildKotobaruPreviewSvg(
       1,
       Math.ceil(
         previewEntries.length /
-          3
+          columnCount
       )
+    );
+  const panelWidth =
+    columnCount === 1
+      ? 270
+      : 220;
+  const panelHeight = 370;
+  const panelGapX = 28;
+  const panelGapY = 30;
+  const horizontalPadding = 70;
+  const width =
+    Math.max(
+      560,
+      horizontalPadding * 2 +
+        columnCount *
+          panelWidth +
+        (columnCount - 1) *
+          panelGapX
     );
   const height =
     105 +
-    rowCount * 388 +
-    70;
-  const panelWidth = 240;
-  const panelHeight = 360;
-  const panelGapX = 28;
-  const panelGapY = 28;
-  const tileSize = 27;
+    rowCount *
+      panelHeight +
+    (rowCount - 1) *
+      panelGapY +
+    55;
+  const tileSize = 30;
   const tileGap = 5;
   const gridWidth =
     tileSize * 5 +
     tileGap * 4;
-  const totalRowWidth =
-    columnCount *
-      panelWidth +
-    (columnCount - 1) *
-      panelGapX;
-  const startX =
-    Math.round(
-      (width -
-        totalRowWidth) /
-        2
-    );
-  const startY = 105;
+  const startY = 100;
 
   let cards = "";
 
@@ -2674,16 +3194,19 @@ function buildKotobaruPreviewSvg(
     (entry, index) => {
       const row =
         Math.floor(
-          index / 3
+          index /
+            columnCount
         );
       const col =
-        index % 3;
+        index %
+        columnCount;
       const itemsThisRow =
         row ===
         rowCount - 1
           ? previewEntries.length -
-            row * 3
-          : 3;
+            row *
+              columnCount
+          : columnCount;
       const thisRowWidth =
         itemsThisRow *
           panelWidth +
@@ -2710,7 +3233,8 @@ function buildKotobaruPreviewSvg(
       const safeName =
         escapeXml(
           shortenDisplayName(
-            entry.displayName
+            entry.displayName,
+            16
           )
         );
       const safeStatus =
@@ -2721,9 +3245,9 @@ function buildKotobaruPreviewSvg(
         );
 
       let avatar = `
-        <circle cx="${x + panelWidth / 2}" cy="${y + 62}" r="45" fill="#3a3a3c" />
-        <circle cx="${x + panelWidth / 2}" cy="${y + 50}" r="15" fill="#818384" />
-        <path d="M ${x + panelWidth / 2 - 28} ${y + 86} Q ${x + panelWidth / 2} ${y + 62} ${x + panelWidth / 2 + 28} ${y + 86}" stroke="#818384" stroke-width="12" stroke-linecap="round" fill="none" />`;
+        <circle cx="${x + panelWidth / 2}" cy="${y + 58}" r="50" fill="#3a3a3c" />
+        <circle cx="${x + panelWidth / 2}" cy="${y + 44}" r="16" fill="#818384" />
+        <path d="M ${x + panelWidth / 2 - 30} ${y + 84} Q ${x + panelWidth / 2} ${y + 61} ${x + panelWidth / 2 + 30} ${y + 84}" stroke="#818384" stroke-width="13" stroke-linecap="round" fill="none" />`;
 
       if (
         entry.avatarDataUri
@@ -2731,10 +3255,10 @@ function buildKotobaruPreviewSvg(
         avatar = `
           <defs>
             <clipPath id="${clipId}">
-              <circle cx="${x + panelWidth / 2}" cy="${y + 62}" r="45" />
+              <circle cx="${x + panelWidth / 2}" cy="${y + 58}" r="50" />
             </clipPath>
           </defs>
-          <image href="${entry.avatarDataUri}" x="${x + panelWidth / 2 - 45}" y="${y + 17}" width="90" height="90" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clipId})" />`;
+          <image href="${entry.avatarDataUri}" x="${x + panelWidth / 2 - 50}" y="${y + 8}" width="100" height="100" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clipId})" />`;
       }
 
       let tiles = "";
@@ -2769,7 +3293,7 @@ function buildKotobaruPreviewSvg(
               (tileSize +
                 tileGap);
           const ty =
-            y + 174 +
+            y + 185 +
             gridRow *
               (tileSize +
                 tileGap);
@@ -2791,12 +3315,15 @@ function buildKotobaruPreviewSvg(
         }
       }
 
+      /*
+       * プレイヤーごとの外枠は描きません。
+       * アイコン・名前・盤面だけを直接配置します。
+       */
       cards += `
         <g>
-          <rect x="${x}" y="${y}" width="${panelWidth}" height="${panelHeight}" rx="24" fill="#121213" stroke="#3a3a3c" stroke-width="2" />
           ${avatar}
-          <text x="${x + panelWidth / 2}" y="${y + 132}" text-anchor="middle" font-family="Source Han Sans HW" font-size="23" font-weight="700" fill="#ffffff">${safeName}</text>
-          <text x="${x + panelWidth / 2}" y="${y + 159}" text-anchor="middle" font-family="Source Han Sans HW" font-size="17" font-weight="400" fill="#d7dadc">${safeStatus}</text>
+          <text x="${x + panelWidth / 2}" y="${y + 132}" text-anchor="middle" font-family="Source Han Sans HW" font-size="25" font-weight="700" fill="#ffffff">${safeName}</text>
+          <text x="${x + panelWidth / 2}" y="${y + 164}" text-anchor="middle" font-family="Source Han Sans HW" font-size="19" font-weight="400" fill="#d7dadc">${safeStatus}</text>
           ${tiles}
         </g>`;
     }
@@ -2807,17 +3334,173 @@ function buildKotobaruPreviewSvg(
   ) {
     cards = `
       <g>
-        <rect x="360" y="105" width="240" height="360" rx="24" fill="#121213" stroke="#3a3a3c" stroke-width="2" />
-        <text x="480" y="255" text-anchor="middle" font-family="Source Han Sans HW" font-size="26" font-weight="700" fill="#ffffff">まだ挑戦者はいません</text>
-        <text x="480" y="295" text-anchor="middle" font-family="Source Han Sans HW" font-size="18" font-weight="400" fill="#d7dadc">最初の挑戦者になりましょう</text>
+        <text x="${width / 2}" y="250" text-anchor="middle" font-family="Source Han Sans HW" font-size="28" font-weight="700" fill="#ffffff">まだ挑戦者はいません</text>
+        <text x="${width / 2}" y="292" text-anchor="middle" font-family="Source Han Sans HW" font-size="20" font-weight="400" fill="#d7dadc">最初の挑戦者になりましょう</text>
       </g>`;
   }
 
   return `
   <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" fill="none" xmlns="http://www.w3.org/2000/svg">
     <rect width="${width}" height="${height}" fill="#121213" />
-    <text x="480" y="58" text-anchor="middle" font-family="Source Han Sans HW" font-size="30" font-weight="700" fill="#ffffff">ことばル 第${puzzleNumber}問</text>
+    <text x="${width / 2}" y="56" text-anchor="middle" font-family="Source Han Sans HW" font-size="34" font-weight="700" fill="#ffffff">ことばル 第${puzzleNumber}問</text>
     ${cards}
+  </svg>`;
+}
+
+function toHiraganaForSummary(
+  value
+) {
+  return String(value || "")
+    .replace(
+      /[ァ-ヶ]/g,
+      (char) =>
+        String.fromCharCode(
+          char.charCodeAt(0) -
+            0x60
+        )
+    );
+}
+
+function buildKotobaruWordsSvg(
+  entries,
+  puzzleNumber
+) {
+  const columnCount =
+    entries.length <= 1
+      ? 1
+      : 2;
+  const rowCount =
+    Math.max(
+      1,
+      Math.ceil(
+        entries.length /
+          columnCount
+      )
+    );
+  const itemWidth = 520;
+  const itemHeight = 285;
+  const gapX = 34;
+  const gapY = 26;
+  const width =
+    Math.max(
+      680,
+      90 * 2 +
+        columnCount *
+          itemWidth +
+        (columnCount - 1) *
+          gapX
+    );
+  const height =
+    110 +
+    rowCount *
+      itemHeight +
+    (rowCount - 1) *
+      gapY +
+    45;
+
+  let content = "";
+
+  entries.forEach(
+    (entry, index) => {
+      const row =
+        Math.floor(
+          index /
+            columnCount
+        );
+      const col =
+        index %
+        columnCount;
+      const x =
+        90 +
+        col *
+          (itemWidth +
+            gapX);
+      const y =
+        95 +
+        row *
+          (itemHeight +
+            gapY);
+      const clipId =
+        `word-avatar-${index}`;
+      const safeName =
+        escapeXml(
+          shortenDisplayName(
+            entry.displayName,
+            18
+          )
+        );
+      const status =
+        entry.won
+          ? `${entry.attempts}/6`
+          : entry.finished
+            ? "×/6"
+            : `${entry.pattern?.length || 0}手`;
+
+      let avatar = `
+        <circle cx="${x + 47}" cy="${y + 48}" r="42" fill="#3a3a3c" />`;
+
+      if (
+        entry.avatarDataUri
+      ) {
+        avatar = `
+          <defs>
+            <clipPath id="${clipId}">
+              <circle cx="${x + 47}" cy="${y + 48}" r="42" />
+            </clipPath>
+          </defs>
+          <image href="${entry.avatarDataUri}" x="${x + 5}" y="${y + 6}" width="84" height="84" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clipId})" />`;
+      }
+
+      const guesses =
+        Array.isArray(
+          entry.guessesDecrypted
+        )
+          ? entry.guessesDecrypted
+          : [];
+
+      let lines = "";
+
+      if (
+        guesses.length === 0
+      ) {
+        lines = `
+          <text x="${x + 110}" y="${y + 134}" font-family="Source Han Sans HW" font-size="21" fill="#818384">回答履歴なし</text>`;
+      } else {
+        guesses.forEach(
+          (guess, guessIndex) => {
+            const display =
+              escapeXml(
+                toHiraganaForSummary(
+                  guess
+                )
+              );
+            const number =
+              guessIndex + 1;
+            const lineY =
+              y + 125 +
+              guessIndex * 30;
+
+            lines += `
+              <text x="${x + 110}" y="${lineY}" font-family="Source Han Sans HW" font-size="22" fill="#f1f1f1">${number}. ${display}</text>`;
+          }
+        );
+      }
+
+      content += `
+        <g>
+          ${avatar}
+          <text x="${x + 110}" y="${y + 42}" font-family="Source Han Sans HW" font-size="26" font-weight="700" fill="#ffffff">${safeName}</text>
+          <text x="${x + 110}" y="${y + 72}" font-family="Source Han Sans HW" font-size="19" fill="#d7dadc">${escapeXml(status)}</text>
+          ${lines}
+        </g>`;
+    }
+  );
+
+  return `
+  <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
+    <rect width="${width}" height="${height}" fill="#121213" />
+    <text x="${width / 2}" y="58" text-anchor="middle" font-family="Source Han Sans HW" font-size="34" font-weight="700" fill="#ffffff">第${puzzleNumber}問　みんなが使ったことば</text>
+    ${content}
   </svg>`;
 }
 
@@ -2840,10 +3523,45 @@ async function renderKotobaruPreviewPng(
 
   const resvg =
     new Resvg(svg, {
-      fitTo: {
-        mode: "width",
-        value: 960,
+      languages: [
+        "ja",
+      ],
+      font: {
+        fontFiles:
+          KOTOBARU_FONT_FILES,
+        loadSystemFonts:
+          true,
+        defaultFontFamily:
+          "Source Han Sans HW",
+        sansSerifFamily:
+          "Source Han Sans HW",
       },
+    });
+
+  return resvg
+    .render()
+    .asPng();
+}
+
+async function renderKotobaruWordsPng(
+  entries,
+  puzzleNumber,
+  guildId
+) {
+  const enriched =
+    await enrichKotobaruEntriesWithAvatars(
+      entries,
+      guildId
+    );
+
+  const svg =
+    buildKotobaruWordsSvg(
+      enriched,
+      puzzleNumber
+    );
+
+  const resvg =
+    new Resvg(svg, {
       languages: [
         "ja",
       ],
@@ -3021,8 +3739,11 @@ async function postKotobaruSummaryForGuild(
     return false;
   }
 
+  /*
+   * 終了済みだけではなく、途中で止めた人も含めて読みます。
+   */
   const records =
-    await loadKotobaruResultsForDate(
+    await loadKotobaruParticipantsForDate(
       guildId,
       date
     );
@@ -3041,8 +3762,14 @@ async function postKotobaruSummaryForGuild(
       )
     );
 
+  /*
+   * 1. 正解者
+   * 2. 少ない手数
+   * 3. 同手数なら終了時刻
+   * 4. 不正解・途中終了は後ろ
+   */
   const sorted =
-    records.sort(
+    [...records].sort(
       (a, b) => {
         if (
           a.won !==
@@ -3065,12 +3792,25 @@ async function postKotobaruSummaryForGuild(
           );
         }
 
+        if (
+          Boolean(a.finished) !==
+          Boolean(b.finished)
+        ) {
+          return a.finished
+            ? -1
+            : 1;
+        }
+
         return (
           new Date(
-            a.savedAt || 0
+            a.savedAt ||
+            a.updatedAt ||
+            0
           ).getTime() -
           new Date(
-            b.savedAt || 0
+            b.savedAt ||
+            b.updatedAt ||
+            0
           ).getTime()
         );
       }
@@ -3080,12 +3820,23 @@ async function postKotobaruSummaryForGuild(
     sorted.map(
       (record) => ({
         ...record,
-        finished: true,
+        historical: true,
+        guessesDecrypted:
+          decryptKotobaruGuesses(
+            record.guessesEncrypted
+          ),
       })
     );
 
   const previewPng =
     await renderKotobaruPreviewPng(
+      entries,
+      puzzleNumber,
+      guildId
+    );
+
+  const wordsPng =
+    await renderKotobaruWordsPng(
       entries,
       puzzleNumber,
       guildId
@@ -3097,20 +3848,29 @@ async function postKotobaruSummaryForGuild(
 
     embeds: [
       {
+        title:
+          "昨日の順位",
         description:
           `${sorted.length}人が挑戦しました。`,
-
         color:
           0x4aa340,
-
         image: {
           url:
             "attachment://preview.png",
         },
-
         footer: {
           text:
             date,
+        },
+      },
+      {
+        title:
+          "みんなが使ったことば",
+        color:
+          0x4aa340,
+        image: {
+          url:
+            "attachment://words.png",
         },
       },
     ],
@@ -3121,7 +3881,14 @@ async function postKotobaruSummaryForGuild(
         filename:
           "preview.png",
         description:
-          "ことばルの昨日の結果プレビュー",
+          "ことばルの昨日の順位",
+      },
+      {
+        id: 1,
+        filename:
+          "words.png",
+        description:
+          "ことばルで昨日使われたことば",
       },
     ],
 
@@ -3141,13 +3908,35 @@ async function postKotobaruSummaryForGuild(
       payload,
       [
         {
-          name: "preview.png",
-          data: previewPng,
+          name:
+            "preview.png",
+          data:
+            previewPng,
+          contentType:
+            "image/png",
+        },
+        {
+          name:
+            "words.png",
+          data:
+            wordsPng,
           contentType:
             "image/png",
         },
       ]
     );
+
+  if (!response.ok) {
+    console.error(
+      "ことばル昨日結果投稿失敗:",
+      response.status,
+      await response
+        .text()
+        .catch(
+          () => ""
+        )
+    );
+  }
 
   return response.ok;
 }
@@ -4098,6 +4887,27 @@ app.post(
         session.sessionId
       );
 
+      /*
+       * 平文の回答単語はDiscordへ保存せず、
+       * AES-256-GCMで暗号化した状態だけをLOGへ更新します。
+       */
+      await upsertKotobaruProgressLog(
+        config,
+        {
+          ...progress,
+          sessionId:
+            session.sessionId,
+        },
+        req.body.guesses
+      ).catch(
+        (error) => {
+          console.error(
+            "ことばル暗号化進捗LOG保存エラー:",
+            error
+          );
+        }
+      );
+
       const updated =
         await upsertKotobaruLiveCard(
           progress.guildId,
@@ -4224,6 +5034,9 @@ app.post(
         won:
           req.body.won,
 
+        finished:
+          true,
+
         pattern:
           req.body.pattern,
 
@@ -4233,41 +5046,20 @@ app.post(
       };
 
       /* =========================
-       * Discord REST APIで
-       * #ことばル-記録へ投稿
+       * 同じ進捗LOGメッセージを終了状態へ更新
+       * 回答単語は暗号化して保存します。
        * ======================= */
 
-      const response =
-        await discordRest(
-          `/channels/${config.logChannelId}/messages`,
-          {
-            method:
-              "POST",
-
-            body:
-              JSON.stringify({
-                content:
-                  `${RECORD_PREFIX}${JSON.stringify(
-                    record
-                  )}`,
-                flags:
-                  SUPPRESS_NOTIFICATIONS_FLAG,
-              }),
-          }
+      try {
+        await upsertKotobaruProgressLog(
+          config,
+          record,
+          req.body.guesses
         );
-
-      if (!response.ok) {
-        const text =
-          await response
-            .text()
-            .catch(
-              () => ""
-            );
-
+      } catch (error) {
         console.error(
-          "ことばル結果Discord保存失敗:",
-          response.status,
-          text
+          "ことばル結果LOG保存失敗:",
+          error
         );
 
         return res
@@ -4364,6 +5156,11 @@ app.get(
       tokenConfigured:
         Boolean(
           KOTOBARU_BOT_TOKEN
+        ),
+
+      encryptionConfigured:
+        Boolean(
+          getKotobaruEncryptionKey()
         ),
     });
   }
@@ -4900,6 +5697,14 @@ async function startKotobaruBot() {
 
   console.log(
     `KOTOBARU_DISCORD_TOKEN: 設定済み / 文字数 ${KOTOBARU_BOT_TOKEN.length}`
+  );
+
+  console.log(
+    `KOTOBARU_LOG_ENCRYPTION_KEY: ${
+      getKotobaruEncryptionKey()
+        ? "設定済み"
+        : "未設定または不正"
+    }`
   );
 
   /*
