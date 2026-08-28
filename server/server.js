@@ -633,8 +633,29 @@ const RECORD_PREFIX =
 const SUMMARY_MARKER_PREFIX =
   "KOTOBARU_SUMMARY_POSTED:";
 
+const LIVE_CARD_MARKER_PREFIX =
+  "KOTOBARU_LIVE_CARD:";
+
 const CONFIG_TOPIC_PREFIX =
   "KOTOBARU_LOG_CHANNEL:";
+
+/*
+ * 今日プレイ中の途中経過。
+ * Render再起動時には消えますが、終了済み結果は
+ * #ことばル-記録 から復元されるため問題ありません。
+ */
+const liveProgressByGuild =
+  new Map();
+
+/*
+ * Discord APIへの不要な再取得を減らすためのキャッシュ。
+ * Render再起動時は自動的に作り直されます。
+ */
+const liveCardMessageIds =
+  new Map();
+
+const finishedRecordsCache =
+  new Map();
 
 /*
  * サーバーごとの設定を
@@ -774,6 +795,90 @@ function validateKotobaruResult(
       1 ||
     body.pattern.length >
       6
+  ) {
+    return false;
+  }
+
+  return body.pattern.every(
+    (row) =>
+      typeof row ===
+        "string" &&
+      /^[🟩🟨🟪⬛]{5}$/u.test(
+        row
+      )
+  );
+}
+
+/* =========================================================
+ * ことばル途中経過の検証
+ * ======================================================= */
+
+function validateKotobaruProgress(
+  body
+) {
+  if (
+    !body ||
+    typeof body !==
+      "object"
+  ) {
+    return false;
+  }
+
+  const requiredStrings = [
+    "guildId",
+    "userId",
+    "displayName",
+    "date",
+  ];
+
+  if (
+    requiredStrings.some(
+      (key) =>
+        typeof body[key] !==
+          "string" ||
+        !body[key]
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    !Number.isInteger(
+      body.puzzleNumber
+    ) ||
+    body.puzzleNumber < 1
+  ) {
+    return false;
+  }
+
+  if (
+    typeof body.finished !==
+      "boolean" ||
+    typeof body.won !==
+      "boolean"
+  ) {
+    return false;
+  }
+
+  if (
+    body.attempts !== null &&
+    (
+      !Number.isInteger(
+        body.attempts
+      ) ||
+      body.attempts < 1 ||
+      body.attempts > 6
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    !Array.isArray(
+      body.pattern
+    ) ||
+    body.pattern.length < 1 ||
+    body.pattern.length > 6
   ) {
     return false;
   }
@@ -1055,47 +1160,70 @@ async function waitForKotobaruBotReady(
   return kotobaruBot.isReady();
 }
 /* =========================================================
- * 記録チャンネル読み込み
+ * Discord RESTでチャンネル履歴を読む
  * ======================================================= */
 
-async function fetchRecentKotobaruMessages(
-  channel,
-  max = 1000
+async function fetchRecentKotobaruMessagesRest(
+  channelId,
+  max = 500
 ) {
   const result = [];
-
   let before;
 
   while (
-    result.length <
-    max
+    result.length < max
   ) {
-    const batch =
-      await channel.messages.fetch({
-        limit: 100,
+    const limit =
+      Math.min(
+        100,
+        max - result.length
+      );
 
-        ...(before
-          ? {
-              before,
-            }
-          : {}),
+    const query =
+      new URLSearchParams({
+        limit:
+          String(limit),
       });
 
+    if (before) {
+      query.set(
+        "before",
+        before
+      );
+    }
+
+    const response =
+      await discordRest(
+        `/channels/${channelId}/messages?${query.toString()}`
+      );
+
+    if (!response.ok) {
+      throw new Error(
+        `Discordメッセージ取得失敗: HTTP ${response.status}`
+      );
+    }
+
+    const batch =
+      await response.json();
+
     if (
-      !batch.size
+      !Array.isArray(batch) ||
+      !batch.length
     ) {
       break;
     }
 
     result.push(
-      ...batch.values()
+      ...batch
     );
 
     before =
-      batch.last()?.id;
+      batch[
+        batch.length - 1
+      ]?.id;
 
     if (
-      batch.size < 100
+      batch.length < limit
     ) {
       break;
     }
@@ -1103,6 +1231,10 @@ async function fetchRecentKotobaruMessages(
 
   return result;
 }
+
+/* =========================================================
+ * 指定日の終了済み結果を読む
+ * ======================================================= */
 
 async function loadKotobaruResultsForDate(
   guildId,
@@ -1117,24 +1249,10 @@ async function loadKotobaruResultsForDate(
     return [];
   }
 
-  const channel =
-    await getKotobaruTextChannel(
-      config.logChannelId
-    );
-
-  if (
-    !channel ||
-    !(
-      "messages" in
-      channel
-    )
-  ) {
-    return [];
-  }
-
   const messages =
-    await fetchRecentKotobaruMessages(
-      channel
+    await fetchRecentKotobaruMessagesRest(
+      config.logChannelId,
+      1000
     );
 
   const byUser =
@@ -1145,7 +1263,9 @@ async function loadKotobaruResultsForDate(
     messages
   ) {
     if (
-      !message.author.bot ||
+      !message.author?.bot ||
+      typeof message.content !==
+        "string" ||
       !message.content.startsWith(
         RECORD_PREFIX
       )
@@ -1170,6 +1290,10 @@ async function loadKotobaruResultsForDate(
         continue;
       }
 
+      /*
+       * Discordは新しいメッセージから返すので、
+       * 最初に見つけたものがその人の最新結果。
+       */
       if (
         !byUser.has(
           record.userId
@@ -1188,6 +1312,569 @@ async function loadKotobaruResultsForDate(
   return [
     ...byUser.values(),
   ];
+}
+
+/* =========================================================
+ * 終了済み結果のキャッシュ
+ * ======================================================= */
+
+async function getCachedKotobaruResults(
+  guildId,
+  date
+) {
+  const key =
+    `${guildId}:${date}`;
+
+  if (
+    finishedRecordsCache.has(
+      key
+    )
+  ) {
+    return [
+      ...finishedRecordsCache
+        .get(key)
+        .values(),
+    ];
+  }
+
+  const records =
+    await loadKotobaruResultsForDate(
+      guildId,
+      date
+    );
+
+  const byUser =
+    new Map(
+      records.map(
+        (record) => [
+          record.userId,
+          record,
+        ]
+      )
+    );
+
+  finishedRecordsCache.set(
+    key,
+    byUser
+  );
+
+  return records;
+}
+
+function cacheFinishedKotobaruRecord(
+  record
+) {
+  const key =
+    `${record.guildId}:${record.date}`;
+
+  let byUser =
+    finishedRecordsCache.get(
+      key
+    );
+
+  if (!byUser) {
+    byUser = new Map();
+
+    finishedRecordsCache.set(
+      key,
+      byUser
+    );
+  }
+
+  byUser.set(
+    record.userId,
+    record
+  );
+}
+
+/* =========================================================
+ * 今日の途中経過をメモリへ保存
+ * ======================================================= */
+
+function setKotobaruLiveProgress(
+  progress
+) {
+  const key =
+    `${progress.guildId}:${progress.date}`;
+
+  let map =
+    liveProgressByGuild.get(
+      key
+    );
+
+  if (!map) {
+    map = new Map();
+
+    liveProgressByGuild.set(
+      key,
+      map
+    );
+  }
+
+  map.set(
+    progress.userId,
+    {
+      ...progress,
+      updatedAt:
+        Date.now(),
+    }
+  );
+}
+
+function getKotobaruLiveProgress(
+  guildId,
+  date
+) {
+  const key =
+    `${guildId}:${date}`;
+
+  const map =
+    liveProgressByGuild.get(
+      key
+    );
+
+  if (!map) {
+    return [];
+  }
+
+  const now =
+    Date.now();
+
+  /*
+   * 3時間以上更新されていない途中経過は
+   * 「挑戦中」扱いから外します。
+   */
+  for (
+    const [
+      userId,
+      progress,
+    ] of map
+  ) {
+    if (
+      !progress.finished &&
+      now -
+        progress.updatedAt >
+        3 * 60 * 60 * 1000
+    ) {
+      map.delete(
+        userId
+      );
+    }
+  }
+
+  return [
+    ...map.values(),
+  ];
+}
+
+/* =========================================================
+ * 「今日の挑戦」公開カード
+ * ======================================================= */
+
+function activityLinkButton(
+  label = "すぐ遊ぶ"
+) {
+  return [
+    {
+      type: 1,
+      components: [
+        {
+          type: 2,
+          style: 5,
+          label,
+          url:
+            `https://discord.com/activities/${KOTOBARU_CLIENT_ID}`,
+        },
+      ],
+    },
+  ];
+}
+
+function buildKotobaruLiveCardPayload(
+  records,
+  liveProgress,
+  puzzleNumber,
+  date
+) {
+  const byUser =
+    new Map();
+
+  /*
+   * まず途中経過を入れる。
+   */
+  for (
+    const progress of
+    liveProgress
+  ) {
+    byUser.set(
+      progress.userId,
+      progress
+    );
+  }
+
+  /*
+   * 終了済み記録がある場合はそちらを優先。
+   */
+  for (
+    const record of
+    records
+  ) {
+    byUser.set(
+      record.userId,
+      {
+        ...record,
+        finished: true,
+      }
+    );
+  }
+
+  const entries =
+    [
+      ...byUser.values(),
+    ].sort(
+      (a, b) => {
+        if (
+          Boolean(a.finished) !==
+          Boolean(b.finished)
+        ) {
+          return a.finished
+            ? 1
+            : -1;
+        }
+
+        if (
+          a.finished &&
+          b.finished
+        ) {
+          if (
+            a.won !==
+            b.won
+          ) {
+            return a.won
+              ? -1
+              : 1;
+          }
+
+          if (
+            a.won &&
+            b.won
+          ) {
+            return (
+              a.attempts -
+              b.attempts
+            );
+          }
+        }
+
+        return (
+          b.pattern.length -
+          a.pattern.length
+        );
+      }
+    );
+
+  const fields =
+    entries
+      .slice(
+        0,
+        20
+      )
+      .map(
+        (entry) => {
+          let status;
+
+          if (
+            !entry.finished
+          ) {
+            status =
+              `${entry.pattern.length}/6　挑戦中`;
+          } else if (
+            entry.won
+          ) {
+            status =
+              `${entry.attempts}/6`;
+          } else {
+            status =
+              "×/6";
+          }
+
+          return {
+            name:
+              `${
+                entry.finished
+                  ? entry.won
+                    ? "✓ "
+                    : ""
+                  : "✏️ "
+              }${entry.displayName}　${status}`,
+
+            value:
+              entry.pattern.join(
+                "\n"
+              ),
+
+            inline: true,
+          };
+        }
+      );
+
+  const activeCount =
+    entries.filter(
+      (entry) =>
+        !entry.finished
+    ).length;
+
+  const finishedCount =
+    entries.filter(
+      (entry) =>
+        entry.finished
+    ).length;
+
+  const description = [
+    activeCount > 0
+      ? `${activeCount}人がいま挑戦中です。`
+      : null,
+
+    finishedCount > 0
+      ? `${finishedCount}人が今日の挑戦を終えました。`
+      : null,
+
+    "答えの文字は伏せたまま、色の並びだけを表示しています。",
+  ]
+    .filter(Boolean)
+    .join(
+      "\n"
+    );
+
+  return {
+    content:
+      `**ことばル　第${puzzleNumber}問**`,
+
+    embeds: [
+      {
+        title:
+          "今日の挑戦",
+
+        description,
+
+        color:
+          0x4aa340,
+
+        fields:
+          fields.length
+            ? fields
+            : [
+                {
+                  name:
+                    "まだ挑戦者はいません",
+                  value:
+                    "最初の挑戦者になりましょう。",
+                  inline:
+                    false,
+                },
+              ],
+
+        footer: {
+          text:
+            date,
+        },
+      },
+    ],
+
+    components:
+      activityLinkButton(
+        "すぐ遊ぶ"
+      ),
+  };
+}
+
+async function findKotobaruLiveCardMessageId(
+  logChannelId,
+  date
+) {
+  const cacheKey =
+    `${logChannelId}:${date}`;
+
+  const cachedId =
+    liveCardMessageIds.get(
+      cacheKey
+    );
+
+  if (cachedId) {
+    return cachedId;
+  }
+
+  const messages =
+    await fetchRecentKotobaruMessagesRest(
+      logChannelId,
+      100
+    );
+
+  const prefix =
+    `${LIVE_CARD_MARKER_PREFIX}${date}:`;
+
+  const marker =
+    messages.find(
+      (message) =>
+        message.author?.bot &&
+        typeof message.content ===
+          "string" &&
+        message.content.startsWith(
+          prefix
+        )
+    );
+
+  if (!marker) {
+    return null;
+  }
+
+  const messageId =
+    marker.content
+      .slice(
+        prefix.length
+      )
+      .trim() || null;
+
+  if (messageId) {
+    liveCardMessageIds.set(
+      cacheKey,
+      messageId
+    );
+  }
+
+  return messageId;
+}
+
+async function saveKotobaruLiveCardMarker(
+  logChannelId,
+  date,
+  messageId
+) {
+  await discordRest(
+    `/channels/${logChannelId}/messages`,
+    {
+      method:
+        "POST",
+
+      body:
+        JSON.stringify({
+          content:
+            `${LIVE_CARD_MARKER_PREFIX}${date}:${messageId}`,
+        }),
+    }
+  );
+
+  liveCardMessageIds.set(
+    `${logChannelId}:${date}`,
+    messageId
+  );
+}
+
+async function upsertKotobaruLiveCard(
+  guildId,
+  date,
+  puzzleNumber
+) {
+  const config =
+    await getKotobaruGuildConfig(
+      guildId
+    );
+
+  if (!config) {
+    return false;
+  }
+
+  const records =
+    await getCachedKotobaruResults(
+      guildId,
+      date
+    );
+
+  const liveProgress =
+    getKotobaruLiveProgress(
+      guildId,
+      date
+    );
+
+  const payload =
+    buildKotobaruLiveCardPayload(
+      records,
+      liveProgress,
+      puzzleNumber,
+      date
+    );
+
+  const existingId =
+    await findKotobaruLiveCardMessageId(
+      config.logChannelId,
+      date
+    );
+
+  if (existingId) {
+    const editResponse =
+      await discordRest(
+        `/channels/${config.summaryChannelId}/messages/${existingId}`,
+        {
+          method:
+            "PATCH",
+
+          body:
+            JSON.stringify(
+              payload
+            ),
+        }
+      );
+
+    if (
+      editResponse.ok
+    ) {
+      return true;
+    }
+
+    console.warn(
+      "今日の挑戦カードを更新できなかったため再作成します:",
+      editResponse.status
+    );
+  }
+
+  const createResponse =
+    await discordRest(
+      `/channels/${config.summaryChannelId}/messages`,
+      {
+        method:
+          "POST",
+
+        body:
+          JSON.stringify(
+            payload
+          ),
+      }
+    );
+
+  if (!createResponse.ok) {
+    console.error(
+      "今日の挑戦カード作成失敗:",
+      createResponse.status,
+      await createResponse
+        .text()
+        .catch(
+          () => ""
+        )
+    );
+
+    return false;
+  }
+
+  const created =
+    await createResponse.json();
+
+  await saveKotobaruLiveCardMarker(
+    config.logChannelId,
+    date,
+    created.id
+  );
+
+  return true;
 }
 
 /* =========================================================
@@ -1216,21 +1903,6 @@ async function postKotobaruSummaryForGuild(
 
   if (
     !records.length
-  ) {
-    return false;
-  }
-
-  const summaryChannel =
-    await getKotobaruTextChannel(
-      config.summaryChannelId
-    );
-
-  if (
-    !summaryChannel ||
-    !(
-      "send" in
-      summaryChannel
-    )
   ) {
     return false;
   }
@@ -1273,20 +1945,14 @@ async function postKotobaruSummaryForGuild(
         20
       )
       .map(
-        (
-          record,
-          index
-        ) => ({
+        (record, index) => ({
           name:
             `${
-              index ===
-                0 &&
+              index === 0 &&
               record.won
                 ? "👑 "
                 : ""
-            }${
-              record.displayName
-            }　${
+            }${record.displayName}　${
               record.won
                 ? `${record.attempts}/6`
                 : "×/6"
@@ -1302,32 +1968,47 @@ async function postKotobaruSummaryForGuild(
         })
       );
 
-  const embed =
-    new EmbedBuilder()
-      .setTitle(
-        `ことばル 第${puzzleNumber}問　昨日の結果`
-      )
-      .setDescription(
-        `${sorted.length}人が挑戦しました。`
-      )
-      .addFields(
-        fields
-      )
-      .setFooter({
-        text:
-          date,
-      });
+  const response =
+    await discordRest(
+      `/channels/${config.summaryChannelId}/messages`,
+      {
+        method:
+          "POST",
 
-  await summaryChannel.send({
-    content:
-      "**今日のことばルも遊べます！**",
+        body:
+          JSON.stringify({
+            content:
+              "**今日のことばルも遊べます！**",
 
-    embeds: [
-      embed,
-    ],
-  });
+            embeds: [
+              {
+                title:
+                  `ことばル 第${puzzleNumber}問　昨日の結果`,
 
-  return true;
+                description:
+                  `${sorted.length}人が挑戦しました。`,
+
+                color:
+                  0x4aa340,
+
+                fields,
+
+                footer: {
+                  text:
+                    date,
+                },
+              },
+            ],
+
+            components:
+              activityLinkButton(
+                "今日も遊ぶ"
+              ),
+          }),
+      }
+    );
+
+  return response.ok;
 }
 
 async function postYesterdayKotobaruSummary() {
@@ -1351,12 +2032,9 @@ async function postYesterdayKotobaruSummary() {
     );
   }
 }
+
 /* =========================================================
- * 昨日の結果を
- * 1日1回だけ投稿
- *
- * Renderのcronだけに頼らず、
- * Activityが最初に開かれた時にも実行します。
+ * 昨日の結果を1日1回だけ投稿
  * ======================================================= */
 
 async function ensureYesterdaySummaryForGuild(
@@ -1374,28 +2052,6 @@ async function ensureYesterdaySummaryForGuild(
     };
   }
 
-  const logChannel =
-    await getKotobaruTextChannel(
-      config.logChannelId
-    );
-
-  if (
-    !logChannel ||
-    !(
-      "messages" in
-      logChannel
-    ) ||
-    !(
-      "send" in
-      logChannel
-    )
-  ) {
-    return {
-      configured: true,
-      posted: false,
-    };
-  }
-
   const today =
     jstDateKey();
 
@@ -1405,18 +2061,16 @@ async function ensureYesterdaySummaryForGuild(
   const marker =
     `${SUMMARY_MARKER_PREFIX}${today}:${yesterday}`;
 
-  /*
-   * 最近のメッセージだけ確認。
-   */
   const recent =
-    await logChannel.messages.fetch({
-      limit: 100,
-    });
+    await fetchRecentKotobaruMessagesRest(
+      config.logChannelId,
+      100
+    );
 
   const alreadyDone =
     recent.some(
       (message) =>
-        message.author.bot &&
+        message.author?.bot &&
         message.content ===
           marker
     );
@@ -1429,21 +2083,24 @@ async function ensureYesterdaySummaryForGuild(
     };
   }
 
-  /*
-   * 昨日の記録があれば公開チャンネルへ投稿。
-   */
   const posted =
     await postKotobaruSummaryForGuild(
       guildId,
       yesterday
     );
 
-  /*
-   * 昨日の参加者が0人でも
-   * 「確認済み」のマーカーは保存。
-   */
-  await logChannel.send(
-    marker
+  await discordRest(
+    `/channels/${config.logChannelId}/messages`,
+    {
+      method:
+        "POST",
+
+      body:
+        JSON.stringify({
+          content:
+            marker,
+        }),
+    }
   );
 
   return {
@@ -1452,6 +2109,7 @@ async function ensureYesterdaySummaryForGuild(
     alreadyDone: false,
   };
 }
+
 /* =========================================================
  * /ことばル設定
  * ======================================================= */
@@ -1909,6 +2567,97 @@ app.post(
 );
 
 /* =========================================================
+ * ことばル途中経過
+ *
+ * 1手ごとに公開チャンネルの「今日の挑戦」を更新します。
+ * 答えの文字そのものは受け取りません。
+ * ======================================================= */
+
+app.post(
+  "/api/kotobaru/progress",
+  async (req, res) => {
+    if (
+      !validateKotobaruProgress(
+        req.body
+      )
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "invalid progress",
+        });
+    }
+
+    const progress = {
+      guildId:
+        req.body.guildId,
+
+      userId:
+        req.body.userId,
+
+      displayName:
+        req.body.displayName
+          .slice(
+            0,
+            80
+          ),
+
+      puzzleNumber:
+        req.body.puzzleNumber,
+
+      date:
+        req.body.date,
+
+      attempts:
+        req.body.attempts,
+
+      won:
+        req.body.won,
+
+      finished:
+        req.body.finished,
+
+      pattern:
+        req.body.pattern,
+    };
+
+    setKotobaruLiveProgress(
+      progress
+    );
+
+    try {
+      const updated =
+        await upsertKotobaruLiveCard(
+          progress.guildId,
+          progress.date,
+          progress.puzzleNumber
+        );
+
+      return res.json({
+        ok: true,
+        cardUpdated:
+          updated,
+      });
+    } catch (error) {
+      console.error(
+        "ことばル途中経過反映エラー:",
+        error
+      );
+
+      /*
+       * ゲーム本体を止めないため、途中経過の表示失敗は
+       * 200で返し、記録処理とは切り離します。
+       */
+      return res.json({
+        ok: true,
+        cardUpdated: false,
+      });
+    }
+  }
+);
+
+/* =========================================================
  * ことばル結果保存
  *
  * Discord Gatewayには依存しません。
@@ -2036,6 +2785,31 @@ app.post(
           });
       }
 
+      /*
+       * 公開カードも終了状態へ更新。
+       */
+      setKotobaruLiveProgress({
+        ...record,
+        finished: true,
+      });
+
+      cacheFinishedKotobaruRecord(
+        record
+      );
+
+      await upsertKotobaruLiveCard(
+        record.guildId,
+        record.date,
+        record.puzzleNumber
+      ).catch(
+        (error) => {
+          console.error(
+            "ことばル公開カード更新エラー:",
+            error
+          );
+        }
+      );
+
       console.log(
         `ことばル結果保存成功: ${record.displayName} / 第${record.puzzleNumber}問 / ${
           record.won
@@ -2117,21 +2891,11 @@ app.post(
         });
     }
 
-    const botReady =
-      await waitForKotobaruBotReady(
-        20000
-      );
-
-    if (!botReady) {
-      return res
-        .status(503)
-        .json({
-          ok: false,
-          botReady: false,
-        });
-    }
-
     try {
+      /*
+       * 昨日の結果確認はREST APIで行うため、
+       * Discord GatewayのReady待ちは不要です。
+       */
       const summary =
         await ensureYesterdaySummaryForGuild(
           guildId
@@ -2139,12 +2903,13 @@ app.post(
 
       return res.json({
         ok: true,
-        botReady: true,
+        gatewayReady:
+          kotobaruBot.isReady(),
         summary,
       });
     } catch (error) {
       console.error(
-        "ことばル awake エラー:",
+        "ことばル起動確認エラー:",
         error
       );
 
@@ -2152,7 +2917,7 @@ app.post(
         .status(500)
         .json({
           ok: false,
-          botReady:
+          gatewayReady:
             kotobaruBot.isReady(),
         });
     }
