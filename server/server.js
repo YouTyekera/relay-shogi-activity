@@ -2212,6 +2212,59 @@ function setKotobaruLiveProgress(
   return next;
 }
 
+function finalizeKotobaruLiveProgress(
+  record,
+  sessionId
+) {
+  /*
+   * 最終結果は常にfinished=trueを正本としてメモリへ反映。
+   */
+  const finalized =
+    setKotobaruLiveProgress(
+      {
+        ...record,
+        finished: true,
+      },
+      sessionId
+    );
+
+  /*
+   * 同一ユーザーの古い未完了状態が別sessionに残っていた場合、
+   * それを削除して「挑戦中」が復活しないようにします。
+   * 1日1回プレイのため、同日同ユーザーの重複sessionは不要です。
+   */
+  const prefix =
+    `${record.guildId}:${record.date}:`;
+
+  for (
+    const [
+      key,
+      map,
+    ] of
+    liveProgressByGuild
+  ) {
+    if (
+      !key.startsWith(
+        prefix
+      ) ||
+      key ===
+        liveSessionKey(
+          record.guildId,
+          record.date,
+          sessionId
+        )
+    ) {
+      continue;
+    }
+
+    map.delete(
+      record.userId
+    );
+  }
+
+  return finalized;
+}
+
 function getKotobaruLiveProgress(
   guildId,
   date,
@@ -2505,6 +2558,69 @@ async function getCurrentKotobaruSession(
   return session;
 }
 
+async function findPersistedKotobaruProgressForUser(
+  config,
+  guildId,
+  date,
+  userId
+) {
+  try {
+    const messages =
+      await fetchRecentKotobaruMessagesRest(
+        config.logChannelId,
+        1000
+      );
+
+    for (
+      const message of
+      messages
+    ) {
+      if (
+        typeof message.content !==
+          "string" ||
+        !message.content.startsWith(
+          PROGRESS_PREFIX
+        )
+      ) {
+        continue;
+      }
+
+      try {
+        const record =
+          JSON.parse(
+            message.content.slice(
+              PROGRESS_PREFIX.length
+            )
+          );
+
+        if (
+          record.guildId ===
+            guildId &&
+          record.date ===
+            date &&
+          record.userId ===
+            userId
+        ) {
+          return {
+            ...record,
+            logMessageId:
+              message.id,
+          };
+        }
+      } catch {
+        // 壊れた進捗LOGは無視
+      }
+    }
+  } catch (error) {
+    console.warn(
+      "ことばル既存進捗の復元失敗:",
+      error
+    );
+  }
+
+  return null;
+}
+
 async function getKotobaruSessionForUser(
   config,
   guildId,
@@ -2551,6 +2667,58 @@ async function getKotobaruSessionForUser(
       date,
       sessionId:
         knownSessionId,
+      messageId: null,
+      startedAt:
+        Date.now(),
+    };
+  }
+
+  /*
+   * Renderが途中で再起動するとliveSessionByUserは消えます。
+   * その状態で最終回答すると、新しいsessionIdへ結果だけが
+   * 入り、元Previewが「挑戦中」のまま残ることがありました。
+   *
+   * そこでメモリに情報がなければ、Discordへ永続保存した
+   * KOTOBARU_PROGRESSからその人のsessionIdを復元します。
+   */
+  const persistedProgress =
+    await findPersistedKotobaruProgressForUser(
+      config,
+      guildId,
+      date,
+      userId
+    );
+
+  if (
+    persistedProgress?.sessionId
+  ) {
+    const restoredSessionId =
+      persistedProgress.sessionId;
+
+    liveSessionByUser.set(
+      userKey,
+      restoredSessionId
+    );
+
+    const persistedSession =
+      await findKotobaruSessionById(
+        config.logChannelId,
+        date,
+        restoredSessionId
+      );
+
+    if (persistedSession) {
+      console.log(
+        `ことばルsession復元: user=${userId} / session=${restoredSessionId}`
+      );
+
+      return persistedSession;
+    }
+
+    return {
+      date,
+      sessionId:
+        restoredSessionId,
       messageId: null,
       startedAt:
         Date.now(),
@@ -4882,10 +5050,29 @@ app.post(
           req.body.pattern,
       };
 
-      setKotobaruLiveProgress(
-        progress,
-        session.sessionId
-      );
+      if (
+        progress.finished
+      ) {
+        finalizeKotobaruLiveProgress(
+          progress,
+          session.sessionId
+        );
+
+        cacheFinishedKotobaruRecord({
+          ...progress,
+          sessionId:
+            session.sessionId,
+          finished: true,
+          savedAt:
+            new Date()
+              .toISOString(),
+        });
+      } else {
+        setKotobaruLiveProgress(
+          progress,
+          session.sessionId
+        );
+      }
 
       /*
        * 平文の回答単語はDiscordへ保存せず、
@@ -5073,11 +5260,8 @@ app.post(
       /*
        * 公開カードも終了状態へ更新。
        */
-      setKotobaruLiveProgress(
-        {
-          ...record,
-          finished: true,
-        },
+      finalizeKotobaruLiveProgress(
+        record,
         session.sessionId
       );
 
@@ -5104,7 +5288,7 @@ app.post(
           record.won
             ? `${record.attempts}/6`
             : "失敗"
-        }`
+        } / session=${session.sessionId}`
       );
 
       return res.json({
