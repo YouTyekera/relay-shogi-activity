@@ -817,6 +817,7 @@ const kotobaruBot =
   new Client({
     intents: [
       GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
     ],
   });
 
@@ -3738,6 +3739,75 @@ kotobaruBot.on(
  * スラッシュコマンド実行
  * ======================================================= */
 
+/* =========================================================
+ * Renderが起きている間は、起動カードをリアルタイムで削除
+ * ======================================================= */
+
+kotobaruBot.on(
+  Events.MessageCreate,
+  async (message) => {
+    try {
+      if (
+        !isKotobaruLaunchCardMessage(
+          message
+        )
+      ) {
+        return;
+      }
+
+      console.log(
+        "ことばル起動カードをGatewayで検知:",
+        JSON.stringify(
+          summarizeKotobaruMessageForLog(
+            message
+          )
+        )
+      );
+
+      const channelId =
+        message.channelId ??
+        message.channel_id;
+
+      if (!channelId) {
+        return;
+      }
+
+      const response =
+        await discordRest(
+          `/channels/${channelId}/messages/${message.id}`,
+          {
+            method: "DELETE",
+          }
+        );
+
+      if (
+        response.ok ||
+        response.status === 404
+      ) {
+        console.log(
+          `ことばル起動カード即時削除: ${message.id}`
+        );
+      } else {
+        console.warn(
+          "ことばル起動カード即時削除失敗:",
+          message.id,
+          response.status,
+          await response
+            .text()
+            .catch(
+              () => ""
+            )
+        );
+      }
+    } catch (error) {
+      console.warn(
+        "ことばル起動カードGateway整理エラー:",
+        error
+      );
+    }
+  }
+);
+
 kotobaruBot.on(
   Events.InteractionCreate,
   async (interaction) => {
@@ -4299,6 +4369,124 @@ app.get(
   }
 );
 
+function getKotobaruMessageApplicationId(
+  message
+) {
+  return (
+    message?.application_id ??
+    message?.applicationId ??
+    message?.application?.id ??
+    message?.interaction?.application_id ??
+    message?.interaction?.applicationId ??
+    null
+  );
+}
+
+function getKotobaruMessageWebhookId(
+  message
+) {
+  return (
+    message?.webhook_id ??
+    message?.webhookId ??
+    null
+  );
+}
+
+function getKotobaruMessageType(
+  message
+) {
+  const value =
+    message?.type?.value ??
+    message?.type;
+
+  return Number.isFinite(
+    Number(value)
+  )
+    ? Number(value)
+    : null;
+}
+
+function isKotobaruLaunchCardMessage(
+  message
+) {
+  const applicationId =
+    getKotobaruMessageApplicationId(
+      message
+    );
+
+  const webhookId =
+    getKotobaruMessageWebhookId(
+      message
+    );
+
+  const type =
+    getKotobaruMessageType(
+      message
+    );
+
+  const hasInteractionMetadata =
+    Boolean(
+      message?.interaction_metadata ||
+      message?.interactionMetadata ||
+      message?.interaction
+    );
+
+  /*
+   * DISCORD_LAUNCH_ACTIVITY が作るフォローアップは、
+   * ことばル Application に紐づくメッセージです。
+   *
+   * 通常のPreview投稿はBot Tokenで作った普通のメッセージなので、
+   * application_id / webhook_id / Interaction metadata の組み合わせには
+   * 基本的に入りません。
+   *
+   * 以前は interaction_metadata 必須にしていたため、
+   * Discord側の自動フォローアップで metadata が省略されるケースを
+   * 取りこぼしていました。
+   */
+  const isKotobaruApplication =
+    applicationId ===
+      KOTOBARU_CLIENT_ID;
+
+  const looksLikeInteractionFollowup =
+    hasInteractionMetadata ||
+    Boolean(webhookId) ||
+    type === 20;
+
+  return (
+    isKotobaruApplication &&
+    looksLikeInteractionFollowup
+  );
+}
+
+function summarizeKotobaruMessageForLog(
+  message
+) {
+  return {
+    id:
+      message?.id ?? null,
+    type:
+      getKotobaruMessageType(
+        message
+      ),
+    authorId:
+      message?.author?.id ?? null,
+    applicationId:
+      getKotobaruMessageApplicationId(
+        message
+      ),
+    webhookId:
+      getKotobaruMessageWebhookId(
+        message
+      ),
+    hasInteractionMetadata:
+      Boolean(
+        message?.interaction_metadata ||
+        message?.interactionMetadata ||
+        message?.interaction
+      ),
+  };
+}
+
 async function cleanupOldKotobaruLaunchMessages(
   channelId
 ) {
@@ -4373,34 +4561,38 @@ async function cleanupOldKotobaruLaunchMessages(
      */
     const launchMessages =
       messages.filter(
-        (message) => {
-          const isKotobaruApplication =
-            message.application_id ===
-              KOTOBARU_CLIENT_ID ||
-            message.interaction_metadata
-              ?.application_id ===
-              KOTOBARU_CLIENT_ID ||
-            message.interaction
-              ?.application_id ===
-              KOTOBARU_CLIENT_ID;
-
-          const isInteractionMessage =
-            Boolean(
-              message.interaction_metadata ||
-              message.interaction
-            );
-
-          /*
-           * author.id がApplication IDと一致するケースもありますが、
-           * それだけではPreviewまで巻き込むため、
-           * 必ずInteraction由来であることも要求します。
-           */
-          return (
-            isKotobaruApplication &&
-            isInteractionMessage
-          );
-        }
+        (message) =>
+          isKotobaruLaunchCardMessage(
+            message
+          )
       );
+
+    /*
+     * 該当0件でも必ずログを残します。
+     * これで「awake自体が来ていない」のか
+     * 「走査したがカードを識別できない」のかを切り分けられます。
+     */
+    console.log(
+      `ことばル起動カード走査: channel=${channelId} / 走査${result.scanned}件 / 該当${launchMessages.length}件`
+    );
+
+    if (
+      launchMessages.length === 0
+    ) {
+      const diagnostic =
+        messages
+          .slice(0, 12)
+          .map(
+            summarizeKotobaruMessageForLog
+          );
+
+      console.log(
+        "ことばル起動カード診断:",
+        JSON.stringify(
+          diagnostic
+        )
+      );
+    }
 
     result.matched =
       launchMessages.length;
@@ -4491,6 +4683,10 @@ function scheduleKotobaruLaunchCleanup(
   ) {
     return;
   }
+
+  console.log(
+    `ことばル起動カード整理を予約: channel=${channelId}`
+  );
 
   const now =
     Date.now();
@@ -4589,6 +4785,10 @@ app.post(
     }
 
     try {
+      console.log(
+        `ことばル awake受信: guild=${guildId} / activityChannel=${channelId || "なし"}`
+      );
+
       /*
        * 昨日の結果確認はREST APIで行うため、
        * Discord GatewayのReady待ちは不要です。
@@ -4599,20 +4799,47 @@ app.post(
         );
 
       /*
-       * Renderが起きたら、Activityを起動したチャンネルだけを
-       * 数回走査し、Discordが自動生成したことばル起動カードを
-       * 後から削除します。
+       * Activity SDK の channelId と、ことばル設定の表示先チャンネルが
+       * 必ずしも同じとは限りません。
        *
-       * この処理は非同期で行うため、Activityの起動自体は待たせません。
+       * Play now! はPreviewのある表示先から押されるため、
+       * 設定済みの summaryChannelId も必ず走査対象へ含めます。
        */
-      scheduleKotobaruLaunchCleanup(
-        channelId
+      const config =
+        await getKotobaruGuildConfig(
+          guildId
+        );
+
+      const cleanupChannels =
+        new Set(
+          [
+            channelId,
+            config?.summaryChannelId,
+          ].filter(Boolean)
+        );
+
+      console.log(
+        "ことばル起動カード整理対象:",
+        JSON.stringify(
+          [...cleanupChannels]
+        )
       );
+
+      for (
+        const cleanupChannelId of
+        cleanupChannels
+      ) {
+        scheduleKotobaruLaunchCleanup(
+          cleanupChannelId
+        );
+      }
 
       return res.json({
         ok: true,
         gatewayReady:
           kotobaruBot.isReady(),
+        cleanupChannels:
+          [...cleanupChannels],
         summary,
       });
     } catch (error) {
