@@ -3,6 +3,7 @@ import "dotenv/config";
 import express from "express";
 import http from "http";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import { Server } from "socket.io";
 import cron from "node-cron";
@@ -260,6 +261,102 @@ const __filename =
 
 const __dirname =
   path.dirname(__filename);
+
+/* =========================================================
+ * Preview画像用 日本語フォント
+ *
+ * Renderには日本語フォントが入っていないことがあるため、
+ * npmパッケージとしてSource Han Sansを読み込みます。
+ * ======================================================= */
+
+const KOTOBARU_FONT_DIR =
+  path.join(
+    process.cwd(),
+    "node_modules",
+    "@fontpkg",
+    "source-han-sans-hw"
+  );
+
+function findKotobaruFontFile(
+  filename
+) {
+  if (
+    !fs.existsSync(
+      KOTOBARU_FONT_DIR
+    )
+  ) {
+    return null;
+  }
+
+  const queue = [
+    KOTOBARU_FONT_DIR,
+  ];
+
+  while (
+    queue.length
+  ) {
+    const current =
+      queue.shift();
+
+    let entries;
+
+    try {
+      entries =
+        fs.readdirSync(
+          current,
+          {
+            withFileTypes:
+              true,
+          }
+        );
+    } catch {
+      continue;
+    }
+
+    for (
+      const entry of
+      entries
+    ) {
+      const fullPath =
+        path.join(
+          current,
+          entry.name
+        );
+
+      if (
+        entry.isDirectory()
+      ) {
+        queue.push(
+          fullPath
+        );
+      } else if (
+        entry.name ===
+          filename
+      ) {
+        return fullPath;
+      }
+    }
+  }
+
+  return null;
+}
+
+const KOTOBARU_FONT_FILES = [
+  findKotobaruFontFile(
+    "SourceHanSansHW-Regular.otf"
+  ),
+  findKotobaruFontFile(
+    "SourceHanSansHW-Bold.otf"
+  ),
+].filter(Boolean);
+
+if (
+  !KOTOBARU_FONT_FILES.length
+) {
+  console.warn(
+    "ことばルPreview用の日本語フォントが見つかりません。@fontpkg/source-han-sans-hw をインストールしてください。"
+  );
+}
 
 /* =========================================================
  * Express
@@ -732,25 +829,45 @@ const SUMMARY_MARKER_PREFIX =
 const LIVE_CARD_MARKER_PREFIX =
   "KOTOBARU_LIVE_CARD:";
 
+const LIVE_SESSION_MARKER_PREFIX =
+  "KOTOBARU_LIVE_SESSION:";
+
 const CONFIG_TOPIC_PREFIX =
   "KOTOBARU_LOG_CHANNEL:";
 
+const LIVE_SESSION_WINDOW_MS =
+  60 * 60 * 1000;
+
+const SUPPRESS_NOTIFICATIONS_FLAG =
+  1 << 12;
+
 /*
  * 今日プレイ中の途中経過。
- * Render再起動時には消えますが、終了済み結果は
- * #ことばル-記録 から復元されるため問題ありません。
+ * セッションごとに分けて保持します。
  */
 const liveProgressByGuild =
   new Map();
 
 /*
- * Discord APIへの不要な再取得を減らすためのキャッシュ。
- * Render再起動時は自動的に作り直されます。
+ * ユーザーがどのセッションで遊び始めたか。
+ * 1時間を超えて遊んでも、その人の盤面は開始した枠を更新します。
  */
-const liveCardMessageIds =
+const liveSessionByUser =
+  new Map();
+
+/*
+ * 各サーバー・日付で現在使っているセッション。
+ */
+const liveSessionCache =
   new Map();
 
 const finishedRecordsCache =
+  new Map();
+
+/*
+ * Discord CDNのアイコン画像を毎回取り直さないためのキャッシュ。
+ */
+const avatarDataCache =
   new Map();
 
 /*
@@ -1015,7 +1132,7 @@ function configFromTopic(
     return null;
   }
 
-  const summaryChannelId =
+  const configHead =
     topic
       .slice(
         CONFIG_TOPIC_PREFIX.length
@@ -1024,6 +1141,15 @@ function configFromTopic(
         /\s|\|/
       )[0]
       ?.trim();
+
+  if (!configHead) {
+    return null;
+  }
+
+  const [
+    summaryChannelId,
+    updatedAtRaw,
+  ] = configHead.split(":");
 
   if (
     !summaryChannelId
@@ -1039,6 +1165,10 @@ function configFromTopic(
       channel.id,
 
     summaryChannelId,
+
+    updatedAt:
+      Number(updatedAtRaw) ||
+      0,
   };
 }
 
@@ -1051,6 +1181,8 @@ async function refreshKotobaruGuildConfig(
       () => null
     );
 
+  const configs = [];
+
   for (
     const channel of
     guild.channels.cache.values()
@@ -1061,29 +1193,40 @@ async function refreshKotobaruGuildConfig(
       );
 
     if (config) {
-      guildConfigs.set(
-        guild.id,
+      configs.push(
         config
       );
-
-      return config;
     }
   }
 
-  guildConfigs.delete(
-    guild.id
+  if (!configs.length) {
+    guildConfigs.delete(
+      guild.id
+    );
+
+    return null;
+  }
+
+  configs.sort(
+    (a, b) =>
+      b.updatedAt -
+      a.updatedAt
   );
 
-  return null;
+  const newest =
+    configs[0];
+
+  guildConfigs.set(
+    guild.id,
+    newest
+  );
+
+  return newest;
 }
 
 async function getKotobaruGuildConfig(
   guildId
 ) {
-  /*
-   * メモリキャッシュがあれば
-   * まずそれを使用。
-   */
   const cached =
     guildConfigs.get(
       guildId
@@ -1093,11 +1236,6 @@ async function getKotobaruGuildConfig(
     return cached;
   }
 
-  /*
-   * Gatewayに頼らず
-   * Discord REST APIから
-   * サーバーのチャンネル一覧を取得。
-   */
   try {
     const response =
       await discordRest(
@@ -1121,18 +1259,12 @@ async function getKotobaruGuildConfig(
     const channels =
       await response.json();
 
-    /*
-     * CONFIG_TOPIC_PREFIX
-     * が付いているテキストチャンネルを探す。
-     */
+    const configs = [];
+
     for (
       const channel of
       channels
     ) {
-      /*
-       * Discord Channel Type 0
-       * = Guild Text
-       */
       if (
         channel.type !== 0
       ) {
@@ -1150,7 +1282,7 @@ async function getKotobaruGuildConfig(
         continue;
       }
 
-      const summaryChannelId =
+      const configHead =
         topic
           .slice(
             CONFIG_TOPIC_PREFIX.length
@@ -1160,28 +1292,54 @@ async function getKotobaruGuildConfig(
           )[0]
           ?.trim();
 
+      if (!configHead) {
+        continue;
+      }
+
+      const [
+        summaryChannelId,
+        updatedAtRaw,
+      ] = configHead.split(":");
+
       if (
         !summaryChannelId
       ) {
         continue;
       }
 
-      const config = {
+      configs.push({
         guildId,
 
         logChannelId:
           channel.id,
 
         summaryChannelId,
-      };
 
-      guildConfigs.set(
-        guildId,
-        config
-      );
-
-      return config;
+        updatedAt:
+          Number(updatedAtRaw) ||
+          0,
+      });
     }
+
+    if (!configs.length) {
+      return null;
+    }
+
+    configs.sort(
+      (a, b) =>
+        b.updatedAt -
+        a.updatedAt
+    );
+
+    const newest =
+      configs[0];
+
+    guildConfigs.set(
+      guildId,
+      newest
+    );
+
+    return newest;
 
   } catch (error) {
     console.error(
@@ -1484,14 +1642,35 @@ function cacheFinishedKotobaruRecord(
 }
 
 /* =========================================================
- * 今日の途中経過をメモリへ保存
+ * 今日の途中経過・1時間単位のプレビュー枠
  * ======================================================= */
 
+function liveSessionKey(
+  guildId,
+  date,
+  sessionId
+) {
+  return `${guildId}:${date}:${sessionId}`;
+}
+
+function liveUserSessionKey(
+  guildId,
+  date,
+  userId
+) {
+  return `${guildId}:${date}:${userId}`;
+}
+
 function setKotobaruLiveProgress(
-  progress
+  progress,
+  sessionId
 ) {
   const key =
-    `${progress.guildId}:${progress.date}`;
+    liveSessionKey(
+      progress.guildId,
+      progress.date,
+      sessionId
+    );
 
   let map =
     liveProgressByGuild.get(
@@ -1507,22 +1686,41 @@ function setKotobaruLiveProgress(
     );
   }
 
+  const next = {
+    ...progress,
+    sessionId,
+    updatedAt:
+      Date.now(),
+  };
+
   map.set(
     progress.userId,
-    {
-      ...progress,
-      updatedAt:
-        Date.now(),
-    }
+    next
   );
+
+  liveSessionByUser.set(
+    liveUserSessionKey(
+      progress.guildId,
+      progress.date,
+      progress.userId
+    ),
+    sessionId
+  );
+
+  return next;
 }
 
 function getKotobaruLiveProgress(
   guildId,
-  date
+  date,
+  sessionId
 ) {
   const key =
-    `${guildId}:${date}`;
+    liveSessionKey(
+      guildId,
+      date,
+      sessionId
+    );
 
   const map =
     liveProgressByGuild.get(
@@ -1537,8 +1735,8 @@ function getKotobaruLiveProgress(
     Date.now();
 
   /*
-   * 3時間以上更新されていない途中経過は
-   * 「挑戦中」扱いから外します。
+   * 3時間以上更新されていない未完了盤面は
+   * 「挑戦中」から外します。
    */
   for (
     const [
@@ -1563,8 +1761,431 @@ function getKotobaruLiveProgress(
   ];
 }
 
+function parseKotobaruLiveSessionMarker(
+  content
+) {
+  if (
+    typeof content !==
+      "string" ||
+    !content.startsWith(
+      LIVE_SESSION_MARKER_PREFIX
+    )
+  ) {
+    return null;
+  }
+
+  try {
+    const value =
+      JSON.parse(
+        content.slice(
+          LIVE_SESSION_MARKER_PREFIX.length
+        )
+      );
+
+    if (
+      typeof value.date !==
+        "string" ||
+      typeof value.sessionId !==
+        "string" ||
+      typeof value.messageId !==
+        "string" ||
+      !Number.isFinite(
+        value.startedAt
+      )
+    ) {
+      return null;
+    }
+
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+async function findLatestKotobaruSession(
+  logChannelId,
+  date
+) {
+  const messages =
+    await fetchRecentKotobaruMessagesRest(
+      logChannelId,
+      100
+    );
+
+  const sessions =
+    messages
+      .map(
+        (message) =>
+          parseKotobaruLiveSessionMarker(
+            message.content
+          )
+      )
+      .filter(
+        (session) =>
+          session &&
+          session.date ===
+            date
+      )
+      .sort(
+        (a, b) =>
+          b.startedAt -
+          a.startedAt
+      );
+
+  return sessions[0] ||
+    null;
+}
+
+async function findKotobaruSessionById(
+  logChannelId,
+  date,
+  sessionId
+) {
+  const messages =
+    await fetchRecentKotobaruMessagesRest(
+      logChannelId,
+      100
+    );
+
+  for (
+    const message of
+    messages
+  ) {
+    const session =
+      parseKotobaruLiveSessionMarker(
+        message.content
+      );
+
+    if (
+      session?.date ===
+        date &&
+      session.sessionId ===
+        sessionId
+    ) {
+      return session;
+    }
+  }
+
+  return null;
+}
+
+async function cleanupLegacyKotobaruLiveCard(
+  config,
+  date
+) {
+  try {
+    const messages =
+      await fetchRecentKotobaruMessagesRest(
+        config.logChannelId,
+        100
+      );
+
+    const prefix =
+      `${LIVE_CARD_MARKER_PREFIX}${date}:`;
+
+    const legacyMarker =
+      messages.find(
+        (message) =>
+          typeof message.content ===
+            "string" &&
+          message.content.startsWith(
+            prefix
+          )
+      );
+
+    if (!legacyMarker) {
+      return;
+    }
+
+    const oldMessageId =
+      legacyMarker.content
+        .slice(
+          prefix.length
+        )
+        .trim();
+
+    if (oldMessageId) {
+      await discordRest(
+        `/channels/${config.summaryChannelId}/messages/${oldMessageId}`,
+        {
+          method:
+            "DELETE",
+        }
+      ).catch(
+        () => null
+      );
+    }
+
+    await discordRest(
+      `/channels/${config.logChannelId}/messages/${legacyMarker.id}`,
+      {
+        method:
+          "DELETE",
+      }
+    ).catch(
+      () => null
+    );
+  } catch (error) {
+    console.warn(
+      "旧形式のことばルPreview整理に失敗しました:",
+      error
+    );
+  }
+}
+
+async function getCurrentKotobaruSession(
+  config,
+  guildId,
+  date
+) {
+  const cacheKey =
+    `${guildId}:${date}`;
+
+  const now =
+    Date.now();
+
+  const cached =
+    liveSessionCache.get(
+      cacheKey
+    );
+
+  if (
+    cached &&
+    now -
+      cached.startedAt <=
+      LIVE_SESSION_WINDOW_MS
+  ) {
+    return cached;
+  }
+
+  const latest =
+    await findLatestKotobaruSession(
+      config.logChannelId,
+      date
+    );
+
+  if (
+    latest &&
+    now -
+      latest.startedAt <=
+      LIVE_SESSION_WINDOW_MS
+  ) {
+    liveSessionCache.set(
+      cacheKey,
+      latest
+    );
+
+    return latest;
+  }
+
+  if (!latest) {
+    await cleanupLegacyKotobaruLiveCard(
+      config,
+      date
+    );
+  }
+
+  const session = {
+    date,
+    sessionId:
+      `${now}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`,
+    messageId: null,
+    startedAt: now,
+  };
+
+  liveSessionCache.set(
+    cacheKey,
+    session
+  );
+
+  return session;
+}
+
+async function getKotobaruSessionForUser(
+  config,
+  guildId,
+  date,
+  userId
+) {
+  const userKey =
+    liveUserSessionKey(
+      guildId,
+      date,
+      userId
+    );
+
+  const knownSessionId =
+    liveSessionByUser.get(
+      userKey
+    );
+
+  if (knownSessionId) {
+    const current =
+      liveSessionCache.get(
+        `${guildId}:${date}`
+      );
+
+    if (
+      current?.sessionId ===
+        knownSessionId
+    ) {
+      return current;
+    }
+
+    const persisted =
+      await findKotobaruSessionById(
+        config.logChannelId,
+        date,
+        knownSessionId
+      );
+
+    if (persisted) {
+      return persisted;
+    }
+
+    return {
+      date,
+      sessionId:
+        knownSessionId,
+      messageId: null,
+      startedAt:
+        Date.now(),
+    };
+  }
+
+  const session =
+    await getCurrentKotobaruSession(
+      config,
+      guildId,
+      date
+    );
+
+  liveSessionByUser.set(
+    userKey,
+    session.sessionId
+  );
+
+  return session;
+}
+
+async function saveKotobaruLiveSessionMarker(
+  logChannelId,
+  session
+) {
+  const response =
+    await discordRest(
+      `/channels/${logChannelId}/messages`,
+      {
+        method:
+          "POST",
+
+        body:
+          JSON.stringify({
+            content:
+              `${LIVE_SESSION_MARKER_PREFIX}${JSON.stringify(
+                session
+              )}`,
+            flags:
+              SUPPRESS_NOTIFICATIONS_FLAG,
+          }),
+      }
+    );
+
+  return response.ok;
+}
+
 /* =========================================================
- * 「今日の挑戦」公開カード
+ * Discordアイコン
+ * ======================================================= */
+
+function discordAvatarUrl(
+  userId,
+  avatarHash
+) {
+  if (avatarHash) {
+    return `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png?size=128`;
+  }
+
+  let index = 0;
+
+  try {
+    index =
+      Number(
+        (BigInt(userId) >>
+          22n) %
+          6n
+      );
+  } catch {
+    index = 0;
+  }
+
+  return `https://cdn.discordapp.com/embed/avatars/${index}.png`;
+}
+
+async function getDiscordAvatarDataUri(
+  userId,
+  avatarHash
+) {
+  const cacheKey =
+    `${userId}:${avatarHash || "default"}`;
+
+  const cached =
+    avatarDataCache.get(
+      cacheKey
+    );
+
+  if (cached) {
+    return cached;
+  }
+
+  try {
+    const response =
+      await fetch(
+        discordAvatarUrl(
+          userId,
+          avatarHash
+        )
+      );
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const bytes =
+      Buffer.from(
+        await response.arrayBuffer()
+      );
+
+    const contentType =
+      response.headers.get(
+        "content-type"
+      ) || "image/png";
+
+    const dataUri =
+      `data:${contentType};base64,${bytes.toString(
+        "base64"
+      )}`;
+
+    avatarDataCache.set(
+      cacheKey,
+      dataUri
+    );
+
+    return dataUri;
+  } catch (error) {
+    console.warn(
+      "Discordアイコン取得失敗:",
+      error
+    );
+
+    return null;
+  }
+}
+
+/* =========================================================
+ * 「今日の挑戦」Preview画像
  * ======================================================= */
 
 function emojiColor(
@@ -1602,7 +2223,7 @@ function escapeXml(
       "&gt;"
     )
     .replaceAll(
-      '\"',
+      '"',
       "&quot;"
     )
     .replaceAll(
@@ -1611,9 +2232,31 @@ function escapeXml(
     );
 }
 
+function shortenDisplayName(
+  value,
+  max = 12
+) {
+  const chars =
+    Array.from(
+      value || "挑戦者"
+    );
+
+  if (
+    chars.length <=
+    max
+  ) {
+    return chars.join("");
+  }
+
+  return `${chars
+    .slice(0, max)
+    .join("")}…`;
+}
+
 function buildKotobaruLiveEntries(
   records,
-  liveProgress
+  liveProgress,
+  sessionId
 ) {
   const byUser =
     new Map();
@@ -1632,6 +2275,13 @@ function buildKotobaruLiveEntries(
     const record of
     records
   ) {
+    if (
+      record.sessionId !==
+        sessionId
+    ) {
+      continue;
+    }
+
     byUser.set(
       record.userId,
       {
@@ -1705,28 +2355,26 @@ function kotobaruStatusText(
 function countKotobaruStatus(
   entries
 ) {
-  const activeCount =
-    entries.filter(
-      (entry) =>
-        !entry.finished
-    ).length;
-
-  const finishedCount =
-    entries.filter(
-      (entry) =>
-        entry.finished
-    ).length;
-
   return {
-    activeCount,
-    finishedCount,
+    activeCount:
+      entries.filter(
+        (entry) =>
+          !entry.finished
+      ).length,
+
+    finishedCount:
+      entries.filter(
+        (entry) =>
+          entry.finished
+      ).length,
   };
 }
 
 function buildKotobaruLiveCardPayload(
   entries,
   puzzleNumber,
-  date
+  date,
+  silent = true
 ) {
   const {
     activeCount,
@@ -1741,7 +2389,7 @@ function buildKotobaruLiveCardPayload(
       : null,
 
     finishedCount > 0
-      ? `${finishedCount}人が今日の挑戦を終えました。`
+      ? `${finishedCount}人がこの時間帯の挑戦を終えました。`
       : null,
 
     "答えの文字は伏せたまま、色の並びだけを表示しています。",
@@ -1757,9 +2405,6 @@ function buildKotobaruLiveCardPayload(
 
     embeds: [
       {
-        title:
-          "今日の挑戦",
-
         description,
 
         color:
@@ -1771,7 +2416,8 @@ function buildKotobaruLiveCardPayload(
         },
 
         footer: {
-          text: date,
+          text:
+            date,
         },
       },
     ],
@@ -1782,10 +2428,34 @@ function buildKotobaruLiveCardPayload(
         filename:
           "preview.png",
         description:
-          "ことばルの進行状況プレビュー",
+          "ことばルの挑戦状況プレビュー",
       },
     ],
+
+    ...(silent
+      ? {
+          flags:
+            SUPPRESS_NOTIFICATIONS_FLAG,
+        }
+      : {}),
   };
+}
+
+async function enrichKotobaruEntriesWithAvatars(
+  entries
+) {
+  return Promise.all(
+    entries.map(
+      async (entry) => ({
+        ...entry,
+        avatarDataUri:
+          await getDiscordAvatarDataUri(
+            entry.userId,
+            entry.avatarHash
+          ),
+      })
+    )
+  );
 }
 
 function buildKotobaruPreviewSvg(
@@ -1795,51 +2465,96 @@ function buildKotobaruPreviewSvg(
   const previewEntries =
     entries.slice(
       0,
-      3
+      6
     );
 
   const width = 960;
-  const height = 540;
-  const panelWidth = 230;
-  const panelHeight = 340;
-  const panelGap = 28;
-  const tileSize = 28;
+  const columnCount =
+    Math.max(
+      1,
+      Math.min(
+        3,
+        previewEntries.length
+      )
+    );
+  const rowCount =
+    Math.max(
+      1,
+      Math.ceil(
+        previewEntries.length /
+          3
+      )
+    );
+  const height =
+    rowCount === 1
+      ? 560
+      : 930;
+  const panelWidth = 240;
+  const panelHeight = 360;
+  const panelGapX = 28;
+  const panelGapY = 28;
+  const tileSize = 27;
   const tileGap = 5;
   const gridWidth =
     tileSize * 5 +
     tileGap * 4;
-  const gridHeight =
-    tileSize * 6 +
-    tileGap * 5;
-  const totalWidth =
-    previewEntries.length > 0
-      ? previewEntries.length *
-          panelWidth +
-        (previewEntries.length -
-          1) *
-          panelGap
-      : panelWidth;
+  const totalRowWidth =
+    columnCount *
+      panelWidth +
+    (columnCount - 1) *
+      panelGapX;
   const startX =
     Math.round(
-      (width - totalWidth) / 2
+      (width -
+        totalRowWidth) /
+        2
     );
+  const startY = 105;
 
   let cards = "";
 
   previewEntries.forEach(
     (entry, index) => {
+      const row =
+        Math.floor(
+          index / 3
+        );
+      const col =
+        index % 3;
+      const itemsThisRow =
+        row ===
+        rowCount - 1
+          ? previewEntries.length -
+            row * 3
+          : 3;
+      const thisRowWidth =
+        itemsThisRow *
+          panelWidth +
+        (itemsThisRow - 1) *
+          panelGapX;
+      const rowStartX =
+        Math.round(
+          (width -
+            thisRowWidth) /
+            2
+        );
       const x =
-        startX +
-        index *
+        rowStartX +
+        col *
           (panelWidth +
-            panelGap);
-      const y = 110;
+            panelGapX);
+      const y =
+        startY +
+        row *
+          (panelHeight +
+            panelGapY);
+      const clipId =
+        `avatar-${index}`;
       const safeName =
         escapeXml(
-          entry.displayName.length >
-            14
-            ? `${entry.displayName.slice(0, 14)}…`
-            : entry.displayName
+          shortenDisplayName(
+            entry.displayName
+          )
         );
       const safeStatus =
         escapeXml(
@@ -1847,31 +2562,44 @@ function buildKotobaruPreviewSvg(
             entry
           )
         );
-      const marker =
-        entry.finished
-          ? entry.won
-            ? "✓"
-            : "×"
-          : "…";
+
+      let avatar = `
+        <circle cx="${x + panelWidth / 2}" cy="${y + 62}" r="45" fill="#3a3a3c" />
+        <circle cx="${x + panelWidth / 2}" cy="${y + 50}" r="15" fill="#818384" />
+        <path d="M ${x + panelWidth / 2 - 28} ${y + 86} Q ${x + panelWidth / 2} ${y + 62} ${x + panelWidth / 2 + 28} ${y + 86}" stroke="#818384" stroke-width="12" stroke-linecap="round" fill="none" />`;
+
+      if (
+        entry.avatarDataUri
+      ) {
+        avatar = `
+          <defs>
+            <clipPath id="${clipId}">
+              <circle cx="${x + panelWidth / 2}" cy="${y + 62}" r="45" />
+            </clipPath>
+          </defs>
+          <image href="${entry.avatarDataUri}" x="${x + panelWidth / 2 - 45}" y="${y + 17}" width="90" height="90" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clipId})" />`;
+      }
 
       let tiles = "";
+
       for (
-        let row = 0;
-        row < 6;
-        row += 1
+        let gridRow = 0;
+        gridRow < 6;
+        gridRow += 1
       ) {
         const rowText =
-          entry.pattern[row] ||
-          "";
+          entry.pattern[
+            gridRow
+          ] || "";
         const chars =
           Array.from(
             rowText
           );
 
         for (
-          let col = 0;
-          col < 5;
-          col += 1
+          let gridCol = 0;
+          gridCol < 5;
+          gridCol += 1
         ) {
           const tx =
             x +
@@ -1880,16 +2608,18 @@ function buildKotobaruPreviewSvg(
                 gridWidth) /
                 2
             ) +
-            col *
+            gridCol *
               (tileSize +
                 tileGap);
           const ty =
-            y + 104 +
-            row *
+            y + 174 +
+            gridRow *
               (tileSize +
                 tileGap);
           const emoji =
-            chars[col];
+            chars[
+              gridCol
+            ];
           const fill = emoji
             ? emojiColor(
                 emoji
@@ -1907,8 +2637,9 @@ function buildKotobaruPreviewSvg(
       cards += `
         <g>
           <rect x="${x}" y="${y}" width="${panelWidth}" height="${panelHeight}" rx="24" fill="#121213" stroke="#3a3a3c" stroke-width="2" />
-          <text x="${x + panelWidth / 2}" y="${y + 42}" text-anchor="middle" font-size="26" font-weight="700" fill="#ffffff">${safeName}</text>
-          <text x="${x + panelWidth / 2}" y="${y + 72}" text-anchor="middle" font-size="18" font-weight="600" fill="#d7dadc">${escapeXml(marker)} ${safeStatus}</text>
+          ${avatar}
+          <text x="${x + panelWidth / 2}" y="${y + 132}" text-anchor="middle" font-family="Source Han Sans HW" font-size="23" font-weight="700" fill="#ffffff">${safeName}</text>
+          <text x="${x + panelWidth / 2}" y="${y + 159}" text-anchor="middle" font-family="Source Han Sans HW" font-size="17" font-weight="400" fill="#d7dadc">${safeStatus}</text>
           ${tiles}
         </g>`;
     }
@@ -1919,27 +2650,38 @@ function buildKotobaruPreviewSvg(
   ) {
     cards = `
       <g>
-        <rect x="${(width - panelWidth) / 2}" y="110" width="${panelWidth}" height="${panelHeight}" rx="24" fill="#121213" stroke="#3a3a3c" stroke-width="2" />
-        <text x="${width / 2}" y="240" text-anchor="middle" font-size="28" font-weight="700" fill="#ffffff">まだ挑戦者はいません</text>
-        <text x="${width / 2}" y="280" text-anchor="middle" font-size="20" fill="#d7dadc">最初の挑戦者になりましょう</text>
+        <rect x="360" y="105" width="240" height="360" rx="24" fill="#121213" stroke="#3a3a3c" stroke-width="2" />
+        <text x="480" y="255" text-anchor="middle" font-family="Source Han Sans HW" font-size="26" font-weight="700" fill="#ffffff">まだ挑戦者はいません</text>
+        <text x="480" y="295" text-anchor="middle" font-family="Source Han Sans HW" font-size="18" font-weight="400" fill="#d7dadc">最初の挑戦者になりましょう</text>
       </g>`;
   }
+
+  const overflowText =
+    entries.length > 6
+      ? `<text x="480" y="${height - 24}" text-anchor="middle" font-family="Source Han Sans HW" font-size="18" fill="#d7dadc">ほか${entries.length - 6}人</text>`
+      : "";
 
   return `
   <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" fill="none" xmlns="http://www.w3.org/2000/svg">
     <rect width="${width}" height="${height}" fill="#121213" />
-    <text x="${width / 2}" y="55" text-anchor="middle" font-size="28" font-weight="700" fill="#ffffff">ことばル 第${puzzleNumber}問</text>
+    <text x="480" y="58" text-anchor="middle" font-family="Source Han Sans HW" font-size="30" font-weight="700" fill="#ffffff">ことばル 第${puzzleNumber}問</text>
     ${cards}
+    ${overflowText}
   </svg>`;
 }
 
-function renderKotobaruPreviewPng(
+async function renderKotobaruPreviewPng(
   entries,
   puzzleNumber
 ) {
+  const enriched =
+    await enrichKotobaruEntriesWithAvatars(
+      entries
+    );
+
   const svg =
     buildKotobaruPreviewSvg(
-      entries,
+      enriched,
       puzzleNumber
     );
 
@@ -1949,6 +2691,19 @@ function renderKotobaruPreviewPng(
         mode: "width",
         value: 960,
       },
+      languages: [
+        "ja",
+      ],
+      font: {
+        fontFiles:
+          KOTOBARU_FONT_FILES,
+        loadSystemFonts:
+          true,
+        defaultFontFamily:
+          "Source Han Sans HW",
+        sansSerifFamily:
+          "Source Han Sans HW",
+      },
     });
 
   return resvg
@@ -1956,92 +2711,11 @@ function renderKotobaruPreviewPng(
     .asPng();
 }
 
-async function findKotobaruLiveCardMessageId(
-  logChannelId,
-  date
-) {
-  const cacheKey =
-    `${logChannelId}:${date}`;
-
-  const cachedId =
-    liveCardMessageIds.get(
-      cacheKey
-    );
-
-  if (cachedId) {
-    return cachedId;
-  }
-
-  const messages =
-    await fetchRecentKotobaruMessagesRest(
-      logChannelId,
-      100
-    );
-
-  const prefix =
-    `${LIVE_CARD_MARKER_PREFIX}${date}:`;
-
-  const marker =
-    messages.find(
-      (message) =>
-        message.author?.bot &&
-        typeof message.content ===
-          "string" &&
-        message.content.startsWith(
-          prefix
-        )
-    );
-
-  if (!marker) {
-    return null;
-  }
-
-  const messageId =
-    marker.content
-      .slice(
-        prefix.length
-      )
-      .trim() || null;
-
-  if (messageId) {
-    liveCardMessageIds.set(
-      cacheKey,
-      messageId
-    );
-  }
-
-  return messageId;
-}
-
-async function saveKotobaruLiveCardMarker(
-  logChannelId,
-  date,
-  messageId
-) {
-  await discordRest(
-    `/channels/${logChannelId}/messages`,
-    {
-      method:
-        "POST",
-
-      body:
-        JSON.stringify({
-          content:
-            `${LIVE_CARD_MARKER_PREFIX}${date}:${messageId}`,
-        }),
-    }
-  );
-
-  liveCardMessageIds.set(
-    `${logChannelId}:${date}`,
-    messageId
-  );
-}
-
 async function upsertKotobaruLiveCard(
   guildId,
   date,
-  puzzleNumber
+  puzzleNumber,
+  session
 ) {
   const config =
     await getKotobaruGuildConfig(
@@ -2052,6 +2726,14 @@ async function upsertKotobaruLiveCard(
     return false;
   }
 
+  const targetSession =
+    session ||
+    await getCurrentKotobaruSession(
+      config,
+      guildId,
+      date
+    );
+
   const records =
     await getCachedKotobaruResults(
       guildId,
@@ -2061,24 +2743,27 @@ async function upsertKotobaruLiveCard(
   const liveProgress =
     getKotobaruLiveProgress(
       guildId,
-      date
+      date,
+      targetSession.sessionId
     );
 
   const entries =
     buildKotobaruLiveEntries(
       records,
-      liveProgress
+      liveProgress,
+      targetSession.sessionId
     );
 
   const payload =
     buildKotobaruLiveCardPayload(
       entries,
       puzzleNumber,
-      date
+      date,
+      true
     );
 
   const previewPng =
-    renderKotobaruPreviewPng(
+    await renderKotobaruPreviewPng(
       entries,
       puzzleNumber
     );
@@ -2092,18 +2777,20 @@ async function upsertKotobaruLiveCard(
     },
   ];
 
-  const existingId =
-    await findKotobaruLiveCardMessageId(
-      config.logChannelId,
-      date
-    );
+  if (
+    targetSession.messageId
+  ) {
+    const editPayload = {
+      ...payload,
+    };
 
-  if (existingId) {
+    delete editPayload.flags;
+
     const editResponse =
       await discordRestMultipart(
-        `/channels/${config.summaryChannelId}/messages/${existingId}`,
+        `/channels/${config.summaryChannelId}/messages/${targetSession.messageId}`,
         "PATCH",
-        payload,
+        editPayload,
         files
       );
 
@@ -2114,7 +2801,7 @@ async function upsertKotobaruLiveCard(
     }
 
     console.warn(
-      "今日の挑戦カードを更新できなかったため再作成します:",
+      "ことばルPreviewを更新できなかったため再作成します:",
       editResponse.status
     );
   }
@@ -2129,7 +2816,7 @@ async function upsertKotobaruLiveCard(
 
   if (!createResponse.ok) {
     console.error(
-      "今日の挑戦カード作成失敗:",
+      "ことばルPreview作成失敗:",
       createResponse.status,
       await createResponse
         .text()
@@ -2144,10 +2831,17 @@ async function upsertKotobaruLiveCard(
   const created =
     await createResponse.json();
 
-  await saveKotobaruLiveCardMarker(
+  targetSession.messageId =
+    created.id;
+
+  liveSessionCache.set(
+    `${guildId}:${date}`,
+    targetSession
+  );
+
+  await saveKotobaruLiveSessionMarker(
     config.logChannelId,
-    date,
-    created.id
+    targetSession
   );
 
   return true;
@@ -2216,74 +2910,71 @@ async function postKotobaruSummaryForGuild(
       }
     );
 
-  const fields =
-    sorted
-      .slice(
-        0,
-        20
-      )
-      .map(
-        (record, index) => ({
-          name:
-            `${
-              index === 0 &&
-              record.won
-                ? "👑 "
-                : ""
-            }${record.displayName}　${
-              record.won
-                ? `${record.attempts}/6`
-                : "×/6"
-            }`,
+  const entries =
+    sorted.map(
+      (record) => ({
+        ...record,
+        finished: true,
+      })
+    );
 
-          value:
-            record.pattern.join(
-              "\n"
-            ),
+  const previewPng =
+    await renderKotobaruPreviewPng(
+      entries,
+      puzzleNumber
+    );
 
-          inline:
-            true,
-        })
-      );
+  const payload = {
+    content:
+      `**ことばル 第${puzzleNumber}問　昨日の結果**`,
+
+    embeds: [
+      {
+        description:
+          `${sorted.length}人が挑戦しました。`,
+
+        color:
+          0x4aa340,
+
+        image: {
+          url:
+            "attachment://preview.png",
+        },
+
+        footer: {
+          text:
+            date,
+        },
+      },
+    ],
+
+    attachments: [
+      {
+        id: 0,
+        filename:
+          "preview.png",
+        description:
+          "ことばルの昨日の結果プレビュー",
+      },
+    ],
+
+    flags:
+      SUPPRESS_NOTIFICATIONS_FLAG,
+  };
 
   const response =
-    await discordRest(
+    await discordRestMultipart(
       `/channels/${config.summaryChannelId}/messages`,
-      {
-        method:
-          "POST",
-
-        body:
-          JSON.stringify({
-            content:
-              "**今日のことばルも遊べます！**",
-
-            embeds: [
-              {
-                title:
-                  `ことばル 第${puzzleNumber}問　昨日の結果`,
-
-                description:
-                  `${sorted.length}人が挑戦しました。`,
-
-                color:
-                  0x4aa340,
-
-                fields,
-
-                footer: {
-                  text:
-                    date,
-                },
-              },
-            ],
-
-            components:
-              activityLinkButton(
-                "今日も遊ぶ"
-              ),
-          }),
-      }
+      "POST",
+      payload,
+      [
+        {
+          name: "preview.png",
+          data: previewPng,
+          contentType:
+            "image/png",
+        },
+      ]
     );
 
   return response.ok;
@@ -2377,6 +3068,8 @@ async function ensureYesterdaySummaryForGuild(
         JSON.stringify({
           content:
             marker,
+          flags:
+            SUPPRESS_NOTIFICATIONS_FLAG,
         }),
     }
   );
@@ -2396,15 +3089,11 @@ async function createKotobaruSetup(
   interaction
 ) {
   if (
-    !interaction.guild ||
-    !interaction.channel ||
-    interaction.channel.type !==
-      ChannelType.GuildText
+    !interaction.guild
   ) {
     await interaction.reply({
       content:
-        "サーバーのテキストチャンネルで実行してください。",
-
+        "サーバー内で実行してください。",
       ephemeral:
         true,
     });
@@ -2420,7 +3109,6 @@ async function createKotobaruSetup(
     await interaction.reply({
       content:
         "この設定には「チャンネルの管理」権限が必要です。",
-
       ephemeral:
         true,
     });
@@ -2428,105 +3116,266 @@ async function createKotobaruSetup(
     return;
   }
 
+  const summaryChannel =
+    interaction.options.getChannel(
+      "表示先",
+      true
+    );
+
+  const logChannel =
+    interaction.options.getChannel(
+      "記録先",
+      true
+    );
+
+  if (
+    summaryChannel.type !==
+      ChannelType.GuildText ||
+    logChannel.type !==
+      ChannelType.GuildText
+  ) {
+    await interaction.reply({
+      content:
+        "表示先・記録先にはテキストチャンネルを指定してください。",
+      ephemeral:
+        true,
+    });
+
+    return;
+  }
+
+  if (
+    summaryChannel.id ===
+    logChannel.id
+  ) {
+    await interaction.reply({
+      content:
+        "表示先と記録先は別のチャンネルを指定してください。記録先には内部データが保存されます。",
+      ephemeral:
+        true,
+    });
+
+    return;
+  }
+
+  const botMember =
+    interaction.guild.members.me;
+
+  if (botMember) {
+    const summaryPermissions =
+      summaryChannel.permissionsFor(
+        botMember
+      );
+
+    const logPermissions =
+      logChannel.permissionsFor(
+        botMember
+      );
+
+    const missingSummary = [];
+    const missingLog = [];
+
+    const summaryChecks = [
+      [
+        PermissionFlagsBits.ViewChannel,
+        "チャンネルを見る",
+      ],
+      [
+        PermissionFlagsBits.SendMessages,
+        "メッセージを送信",
+      ],
+      [
+        PermissionFlagsBits.EmbedLinks,
+        "埋め込みリンク",
+      ],
+      [
+        PermissionFlagsBits.AttachFiles,
+        "ファイルを添付",
+      ],
+    ];
+
+    const logChecks = [
+      [
+        PermissionFlagsBits.ViewChannel,
+        "チャンネルを見る",
+      ],
+      [
+        PermissionFlagsBits.SendMessages,
+        "メッセージを送信",
+      ],
+      [
+        PermissionFlagsBits.ReadMessageHistory,
+        "メッセージ履歴を読む",
+      ],
+      [
+        PermissionFlagsBits.ManageChannels,
+        "チャンネルの管理",
+      ],
+    ];
+
+    for (
+      const [
+        permission,
+        label,
+      ] of summaryChecks
+    ) {
+      if (
+        !summaryPermissions?.has(
+          permission
+        )
+      ) {
+        missingSummary.push(
+          label
+        );
+      }
+    }
+
+    for (
+      const [
+        permission,
+        label,
+      ] of logChecks
+    ) {
+      if (
+        !logPermissions?.has(
+          permission
+        )
+      ) {
+        missingLog.push(
+          label
+        );
+      }
+    }
+
+    if (
+      missingSummary.length ||
+      missingLog.length
+    ) {
+      const lines = [
+        "ことばルBotの権限が不足しています。",
+      ];
+
+      if (
+        missingSummary.length
+      ) {
+        lines.push(
+          `・表示先：${missingSummary.join("、")}`
+        );
+      }
+
+      if (
+        missingLog.length
+      ) {
+        lines.push(
+          `・記録先：${missingLog.join("、")}`
+        );
+      }
+
+      await interaction.reply({
+        content:
+          lines.join("\n"),
+        ephemeral:
+          true,
+      });
+
+      return;
+    }
+  }
+
   await interaction.deferReply({
     ephemeral:
       true,
   });
 
-  const guild =
-    interaction.guild;
+  const configuredAt =
+    Date.now();
 
-  const summaryChannel =
-    interaction.channel;
+  /*
+   * 記録先チャンネルのトピックに設定を保存します。
+   * 古い方式の自動作成チャンネルが残っていても、
+   * updatedAtが新しい設定を優先するため誤認しません。
+   */
+  const previousTopic =
+    logChannel.topic || "";
 
-  const config =
-    await refreshKotobaruGuildConfig(
-      guild
-    );
-
-  let logChannel =
-    config
-      ? guild.channels.cache.get(
-          config.logChannelId
-        )
-      : null;
+  let preservedTopic =
+    previousTopic;
 
   if (
-    !logChannel ||
-    logChannel.type !==
-      ChannelType.GuildText
+    previousTopic.startsWith(
+      CONFIG_TOPIC_PREFIX
+    )
   ) {
-    logChannel =
-      await guild.channels.create({
-        name:
-          "ことばル-記録",
-
-        type:
-          ChannelType.GuildText,
-
-        parent:
-          summaryChannel.parentId ??
-          undefined,
-
-        topic:
-          `${CONFIG_TOPIC_PREFIX}${summaryChannel.id} | ことばルの結果記録用`,
-
-        permissionOverwrites: [
-          {
-            id:
-              guild.roles
-                .everyone
-                .id,
-
-            deny: [
-              PermissionFlagsBits.ViewChannel,
-            ],
-          },
-
-          {
-            id:
-              kotobaruBot
-                .user.id,
-
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.ReadMessageHistory,
-              PermissionFlagsBits.ManageChannels,
-            ],
-          },
-        ],
-
-        reason:
-          "ことばルの結果記録用",
-      });
-  } else {
-    await logChannel.setTopic(
-      `${CONFIG_TOPIC_PREFIX}${summaryChannel.id} | ことばルの結果記録用`
-    );
+    preservedTopic =
+      previousTopic.includes("|")
+        ? previousTopic
+            .split("|")
+            .slice(1)
+            .join("|")
+            .trim()
+        : "";
   }
 
+  if (
+    preservedTopic ===
+    "ことばルの結果記録用"
+  ) {
+    preservedTopic = "";
+  }
+
+  const configTopic =
+    `${CONFIG_TOPIC_PREFIX}${summaryChannel.id}:${configuredAt}` +
+    (preservedTopic
+      ? ` | ${preservedTopic}`
+      : " | ことばルの結果記録用");
+
+  try {
+    await logChannel.setTopic(
+      configTopic.slice(
+        0,
+        1024
+      )
+    );
+  } catch (error) {
+    console.error(
+      "ことばル記録先トピック設定失敗:",
+      error
+    );
+
+    await interaction.editReply(
+      "記録先チャンネルの設定を書き込めませんでした。ことばルBotに、そのチャンネルの「チャンネルの管理」「チャンネルを見る」「メッセージを送信」「メッセージ履歴を読む」権限があるか確認してください。"
+    );
+
+    return;
+  }
+
+  const config = {
+    guildId:
+      interaction.guild.id,
+
+    logChannelId:
+      logChannel.id,
+
+    summaryChannelId:
+      summaryChannel.id,
+
+    updatedAt:
+      configuredAt,
+  };
+
   guildConfigs.set(
-    guild.id,
-    {
-      guildId:
-        guild.id,
-
-      logChannelId:
-        logChannel.id,
-
-      summaryChannelId:
-        summaryChannel.id,
-    }
+    interaction.guild.id,
+    config
   );
 
   await interaction.editReply(
     [
       "ことばルの設定が完了しました。",
-      `・昨日の結果：${summaryChannel}`,
-      `・記録用：${logChannel}`,
+      `・挑戦状況・昨日の結果：${summaryChannel}`,
+      `・内部記録：${logChannel}`,
       "",
-      "記録用チャンネルは一般メンバーから非表示です。",
+      "記録先チャンネルは自動作成しません。必要に応じてサーバー側で一般メンバーから非表示にしてください。",
+      "以前の自動作成チャンネルがある場合も自動削除はしません。不要なら確認後に手動で削除できます。",
     ].join("\n")
   );
 }
@@ -2567,7 +3416,7 @@ async function showKotobaruSetup(
 
   if (!config) {
     await interaction.editReply(
-      "まだ設定されていません。結果を表示したいチャンネルで `/ことばル設定` を実行してください。"
+      "まだ設定されていません。`/ことばル設定` で表示先と記録先を指定してください。"
     );
 
     return;
@@ -2592,7 +3441,39 @@ const kotobaruCommands = [
       "ことばル設定"
     )
     .setDescription(
-      "このチャンネルを昨日の結果の投稿先に設定します"
+      "ことばルの表示先と記録先を設定します"
+    )
+    .addChannelOption(
+      (option) =>
+        option
+          .setName(
+            "表示先"
+          )
+          .setDescription(
+            "挑戦状況や昨日の結果を表示するチャンネル"
+          )
+          .addChannelTypes(
+            ChannelType.GuildText
+          )
+          .setRequired(
+            true
+          )
+    )
+    .addChannelOption(
+      (option) =>
+        option
+          .setName(
+            "記録先"
+          )
+          .setDescription(
+            "内部記録を保存するチャンネル（非公開推奨）"
+          )
+          .addChannelTypes(
+            ChannelType.GuildText
+          )
+          .setRequired(
+            true
+          )
     )
     .setDefaultMemberPermissions(
       PermissionFlagsBits.ManageChannels
@@ -2621,27 +3502,58 @@ const kotobaruCommands = [
     command.toJSON()
 );
 
+async function registerKotobaruCommandsForGuild(
+  guild
+) {
+  try {
+    await guild.commands.set(
+      kotobaruCommands
+    );
+
+    console.log(
+      `ことばルコマンド同期完了: ${guild.name}`
+    );
+
+    return true;
+  } catch (error) {
+    console.error(
+      `ことばルコマンド同期エラー: ${guild.name}`,
+      error
+    );
+
+    return false;
+  }
+}
+
 async function registerKotobaruCommands() {
   for (
     const guild of
     kotobaruBot.guilds.cache.values()
   ) {
-    try {
-      await guild.commands.set(
-        kotobaruCommands
-      );
-
-      console.log(
-        `ことばルコマンド同期完了: ${guild.name}`
-      );
-    } catch (error) {
-      console.error(
-        `ことばルコマンド同期エラー: ${guild.name}`,
-        error
-      );
-    }
+    await registerKotobaruCommandsForGuild(
+      guild
+    );
   }
 }
+
+/*
+ * 新しいサーバーへ導入された場合も、Render再起動を待たず
+ * そのサーバーへ設定コマンドを登録します。
+ */
+kotobaruBot.on(
+  Events.GuildCreate,
+  async (guild) => {
+    await registerKotobaruCommandsForGuild(
+      guild
+    );
+
+    await refreshKotobaruGuildConfig(
+      guild
+    ).catch(
+      () => null
+    );
+  }
+);
 
 /* =========================================================
  * スラッシュコマンド実行
@@ -2867,55 +3779,91 @@ app.post(
         });
     }
 
-    const progress = {
-      guildId:
-        req.body.guildId,
-
-      userId:
-        req.body.userId,
-
-      displayName:
-        req.body.displayName
-          .slice(
-            0,
-            80
-          ),
-
-      puzzleNumber:
-        req.body.puzzleNumber,
-
-      date:
-        req.body.date,
-
-      attempts:
-        req.body.attempts,
-
-      won:
-        req.body.won,
-
-      finished:
-        req.body.finished,
-
-      pattern:
-        req.body.pattern,
-    };
-
-    setKotobaruLiveProgress(
-      progress
-    );
-
     try {
+      const config =
+        await getKotobaruGuildConfig(
+          req.body.guildId
+        );
+
+      /*
+       * 未設定サーバーでもゲーム自体は遊べるよう、
+       * 公開カードだけ作らず正常終了します。
+       */
+      if (!config) {
+        return res.json({
+          ok: true,
+          configured: false,
+          cardUpdated: false,
+        });
+      }
+
+      const session =
+        await getKotobaruSessionForUser(
+          config,
+          req.body.guildId,
+          req.body.date,
+          req.body.userId
+        );
+
+      const progress = {
+        guildId:
+          req.body.guildId,
+
+        userId:
+          req.body.userId,
+
+        displayName:
+          req.body.displayName
+            .slice(
+              0,
+              80
+            ),
+
+        avatarHash:
+          typeof req.body.avatarHash ===
+            "string"
+            ? req.body.avatarHash
+            : null,
+
+        puzzleNumber:
+          req.body.puzzleNumber,
+
+        date:
+          req.body.date,
+
+        attempts:
+          req.body.attempts,
+
+        won:
+          req.body.won,
+
+        finished:
+          req.body.finished,
+
+        pattern:
+          req.body.pattern,
+      };
+
+      setKotobaruLiveProgress(
+        progress,
+        session.sessionId
+      );
+
       const updated =
         await upsertKotobaruLiveCard(
           progress.guildId,
           progress.date,
-          progress.puzzleNumber
+          progress.puzzleNumber,
+          session
         );
 
       return res.json({
         ok: true,
+        configured: true,
         cardUpdated:
           updated,
+        sessionId:
+          session.sessionId,
       });
     } catch (error) {
       console.error(
@@ -2924,8 +3872,7 @@ app.post(
       );
 
       /*
-       * ゲーム本体を止めないため、途中経過の表示失敗は
-       * 200で返し、記録処理とは切り離します。
+       * 公開Previewの失敗でゲームを止めません。
        */
       return res.json({
         ok: true,
@@ -2981,6 +3928,14 @@ app.post(
           });
       }
 
+      const session =
+        await getKotobaruSessionForUser(
+          config,
+          req.body.guildId,
+          req.body.date,
+          req.body.userId
+        );
+
       /* =========================
        * 保存内容
        * ======================= */
@@ -2998,6 +3953,15 @@ app.post(
               0,
               80
             ),
+
+        avatarHash:
+          typeof req.body.avatarHash ===
+            "string"
+            ? req.body.avatarHash
+            : null,
+
+        sessionId:
+          session.sessionId,
 
         puzzleNumber:
           req.body.puzzleNumber,
@@ -3037,6 +4001,8 @@ app.post(
                   `${RECORD_PREFIX}${JSON.stringify(
                     record
                   )}`,
+                flags:
+                  SUPPRESS_NOTIFICATIONS_FLAG,
               }),
           }
         );
@@ -3066,10 +4032,13 @@ app.post(
       /*
        * 公開カードも終了状態へ更新。
        */
-      setKotobaruLiveProgress({
-        ...record,
-        finished: true,
-      });
+      setKotobaruLiveProgress(
+        {
+          ...record,
+          finished: true,
+        },
+        session.sessionId
+      );
 
       cacheFinishedKotobaruRecord(
         record
@@ -3078,7 +4047,8 @@ app.post(
       await upsertKotobaruLiveCard(
         record.guildId,
         record.date,
-        record.puzzleNumber
+        record.puzzleNumber,
+        session
       ).catch(
         (error) => {
           console.error(
@@ -3150,11 +4120,91 @@ app.get(
   }
 );
 
+async function cleanupOldKotobaruLaunchMessages(
+  channelId
+) {
+  if (
+    typeof channelId !==
+      "string" ||
+    !channelId
+  ) {
+    return;
+  }
+
+  try {
+    const response =
+      await discordRest(
+        `/channels/${channelId}/messages?limit=30`
+      );
+
+    if (!response.ok) {
+      return;
+    }
+
+    const messages =
+      await response.json();
+
+    /*
+     * DiscordがEntry Point（起動）を実行した際に作る
+     * CHAT_INPUT_COMMAND系のゲーム招待メッセージだけを対象にします。
+     * ことばル自身のPreview投稿（type 0）は削除しません。
+     */
+    const launchMessages =
+      messages
+        .filter(
+          (message) =>
+            message.type === 20 &&
+            (
+              message.application_id ===
+                KOTOBARU_CLIENT_ID ||
+              message.interaction_metadata?.application_id ===
+                KOTOBARU_CLIENT_ID
+            )
+        )
+        .sort(
+          (a, b) =>
+            new Date(
+              b.timestamp
+            ).getTime() -
+            new Date(
+              a.timestamp
+            ).getTime()
+        );
+
+    /*
+     * 最新1件だけ残すことで、起動するたびに招待カードが
+     * 積み上がる状態を防ぎます。
+     */
+    for (
+      const oldMessage of
+      launchMessages.slice(1)
+    ) {
+      await discordRest(
+        `/channels/${channelId}/messages/${oldMessage.id}`,
+        {
+          method:
+            "DELETE",
+        }
+      ).catch(
+        () => null
+      );
+    }
+  } catch (error) {
+    console.warn(
+      "古い起動メッセージ整理に失敗しました:",
+      error
+    );
+  }
+}
+
 app.post(
   "/api/kotobaru/awake",
   async (req, res) => {
     const guildId =
       req.body?.guildId;
+
+    const channelId =
+      req.body?.channelId;
 
     if (
       typeof guildId !==
@@ -3178,6 +4228,10 @@ app.post(
         await ensureYesterdaySummaryForGuild(
           guildId
         );
+
+      await cleanupOldKotobaruLaunchMessages(
+        channelId
+      );
 
       return res.json({
         ok: true,
