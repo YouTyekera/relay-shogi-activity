@@ -905,6 +905,13 @@ const guildConfigs =
 const launchCleanupScheduledUntil =
   new Map();
 
+/*
+ * 盤面復元APIでBearer Tokenを毎回Discordへ照会しすぎないための
+ * 短時間キャッシュ。キー自体は保存せずSHA-256だけを保持します。
+ */
+const oauthUserCache =
+  new Map();
+
 /* =========================================================
  * 日本時間
  * ======================================================= */
@@ -1891,56 +1898,16 @@ async function findKotobaruProgressLogMessageId(
     return cached;
   }
 
-  const messages =
-    await fetchRecentKotobaruMessagesRest(
-      config.logChannelId,
-      1000
+  const persisted =
+    await findPersistedKotobaruProgressForUser(
+      config,
+      guildId,
+      date,
+      userId
     );
 
-  for (
-    const message of
-    messages
-  ) {
-    if (
-      !message.author?.bot ||
-      typeof message.content !==
-        "string" ||
-      !message.content.startsWith(
-        PROGRESS_PREFIX
-      )
-    ) {
-      continue;
-    }
-
-    try {
-      const record =
-        JSON.parse(
-          message.content.slice(
-            PROGRESS_PREFIX.length
-          )
-        );
-
-      if (
-        record.guildId ===
-          guildId &&
-        record.date ===
-          date &&
-        record.userId ===
-          userId
-      ) {
-        progressLogMessageIds.set(
-          key,
-          message.id
-        );
-
-        return message.id;
-      }
-    } catch {
-      // 壊れたメッセージは無視
-    }
-  }
-
-  return null;
+  return persisted?.logMessageId ||
+    null;
 }
 
 async function upsertKotobaruProgressLog(
@@ -2558,57 +2525,183 @@ async function getCurrentKotobaruSession(
   return session;
 }
 
+function jstDateStartUtcMs(
+  date
+) {
+  const [
+    year,
+    month,
+    day,
+  ] = date
+    .split("-")
+    .map(Number);
+
+  /*
+   * JST 00:00 = 前日UTC 15:00
+   */
+  return Date.UTC(
+    year,
+    month - 1,
+    day,
+    -9,
+    0,
+    0,
+    0
+  );
+}
+
 async function findPersistedKotobaruProgressForUser(
   config,
   guildId,
   date,
   userId
 ) {
-  try {
-    const messages =
-      await fetchRecentKotobaruMessagesRest(
-        config.logChannelId,
-        1000
-      );
+  /*
+   * 他BotとLOGチャンネルを共用していても、
+   * 「直近1000件」に押し出されて消えないよう、
+   * 対象日の開始時刻までページングします。
+   */
+  const targetStart =
+    jstDateStartUtcMs(
+      date
+    );
 
-    for (
-      const message of
-      messages
+  const targetEnd =
+    targetStart +
+    24 * 60 * 60 * 1000;
+
+  let before = null;
+  let scanned = 0;
+  const maxScan = 10000;
+
+  try {
+    while (
+      scanned < maxScan
     ) {
-      if (
-        typeof message.content !==
-          "string" ||
-        !message.content.startsWith(
-          PROGRESS_PREFIX
-        )
-      ) {
-        continue;
+      const query =
+        new URLSearchParams({
+          limit: "100",
+        });
+
+      if (before) {
+        query.set(
+          "before",
+          before
+        );
       }
 
-      try {
-        const record =
-          JSON.parse(
-            message.content.slice(
-              PROGRESS_PREFIX.length
-            )
-          );
+      const response =
+        await discordRest(
+          `/channels/${config.logChannelId}/messages?${query.toString()}`
+        );
 
+      if (!response.ok) {
+        throw new Error(
+          `Discord進捗検索失敗: HTTP ${response.status}`
+        );
+      }
+
+      const messages =
+        await response.json();
+
+      if (
+        !Array.isArray(messages) ||
+        messages.length === 0
+      ) {
+        break;
+      }
+
+      scanned +=
+        messages.length;
+
+      for (
+        const message of
+        messages
+      ) {
         if (
-          record.guildId ===
-            guildId &&
-          record.date ===
-            date &&
-          record.userId ===
-            userId
+          typeof message.content !==
+            "string" ||
+          !message.content.startsWith(
+            PROGRESS_PREFIX
+          )
         ) {
-          return {
-            ...record,
-            logMessageId:
-              message.id,
-          };
+          continue;
         }
-      } catch {
-        // 壊れた進捗LOGは無視
+
+        try {
+          const record =
+            JSON.parse(
+              message.content.slice(
+                PROGRESS_PREFIX.length
+              )
+            );
+
+          if (
+            record.guildId ===
+              guildId &&
+            record.date ===
+              date &&
+            record.userId ===
+              userId
+          ) {
+            progressLogMessageIds.set(
+              progressLogCacheKey(
+                guildId,
+                date,
+                userId
+              ),
+              message.id
+            );
+
+            return {
+              ...record,
+              logMessageId:
+                message.id,
+            };
+          }
+        } catch {
+          // 壊れた進捗LOGは無視
+        }
+      }
+
+      const oldest =
+        messages[
+          messages.length - 1
+        ];
+
+      before =
+        oldest?.id ||
+        null;
+
+      /*
+       * メッセージ作成日時が対象日より前まで来たら終了。
+       * 編集済みKOTOBARU_PROGRESSも作成自体はその日の初回回答時です。
+       */
+      const oldestTime =
+        Date.parse(
+          oldest?.timestamp ||
+          ""
+        );
+
+      if (
+        Number.isFinite(
+          oldestTime
+        ) &&
+        oldestTime <
+          targetStart
+      ) {
+        break;
+      }
+
+      /*
+       * 最新側から探しているため、対象日より未来のログが大量にあっても
+       * 対象日まで継続して下ります。
+       */
+      if (
+        messages.length <
+          100
+      ) {
+        break;
       }
     }
   } catch (error) {
@@ -2618,7 +2711,85 @@ async function findPersistedKotobaruProgressForUser(
     );
   }
 
+  console.log(
+    `ことばル進捗LOG検索: user=${userId} / date=${date} / 走査${scanned}件 / 見つからず`
+  );
+
   return null;
+}
+
+async function resolveDiscordUserFromBearer(
+  authorization
+) {
+  if (
+    typeof authorization !==
+      "string" ||
+    !authorization.startsWith(
+      "Bearer "
+    )
+  ) {
+    return null;
+  }
+
+  const token =
+    authorization
+      .slice(7)
+      .trim();
+
+  if (!token) {
+    return null;
+  }
+
+  const cacheKey =
+    crypto
+      .createHash(
+        "sha256"
+      )
+      .update(token)
+      .digest("hex");
+
+  const cached =
+    oauthUserCache.get(
+      cacheKey
+    );
+
+  if (
+    cached &&
+    cached.expiresAt >
+      Date.now()
+  ) {
+    return cached.user;
+  }
+
+  const response =
+    await fetch(
+      `${DISCORD_API}/users/@me`,
+      {
+        headers: {
+          Authorization:
+            `Bearer ${token}`,
+        },
+      }
+    );
+
+  if (!response.ok) {
+    return null;
+  }
+
+  const user =
+    await response.json();
+
+  oauthUserCache.set(
+    cacheKey,
+    {
+      user,
+      expiresAt:
+        Date.now() +
+        5 * 60 * 1000,
+    }
+  );
+
+  return user;
 }
 
 async function getKotobaruSessionForUser(
@@ -4957,6 +5128,184 @@ app.post(
         .json({
           error:
             "token exchange failed",
+        });
+    }
+  }
+);
+
+/* =========================================================
+ * ことばル 保存盤面復元
+ *
+ * localStorageが消えていても、Discord LOGを正本として復元します。
+ * Bearer TokenをDiscordへ照会し、要求した本人のデータだけ返します。
+ * ======================================================= */
+
+app.post(
+  "/api/kotobaru/state",
+  async (req, res) => {
+    const guildId =
+      req.body?.guildId;
+
+    const date =
+      req.body?.date;
+
+    const puzzleNumber =
+      req.body?.puzzleNumber;
+
+    if (
+      typeof guildId !==
+        "string" ||
+      !guildId ||
+      typeof date !==
+        "string" ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(
+        date
+      )
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "invalid restore request",
+        });
+    }
+
+    try {
+      const discordUser =
+        await resolveDiscordUserFromBearer(
+          req.headers.authorization
+        );
+
+      if (
+        !discordUser?.id
+      ) {
+        return res
+          .status(401)
+          .json({
+            error:
+              "Discord authentication required",
+          });
+      }
+
+      const config =
+        await getKotobaruGuildConfig(
+          guildId
+        );
+
+      if (!config) {
+        return res.json({
+          ok: true,
+          found: false,
+          restorable: false,
+          configured: false,
+        });
+      }
+
+      const record =
+        await findPersistedKotobaruProgressForUser(
+          config,
+          guildId,
+          date,
+          discordUser.id
+        );
+
+      if (!record) {
+        return res.json({
+          ok: true,
+          found: false,
+          restorable: false,
+          configured: true,
+        });
+      }
+
+      if (
+        Number.isInteger(
+          puzzleNumber
+        ) &&
+        record.puzzleNumber !==
+          puzzleNumber
+      ) {
+        return res.json({
+          ok: true,
+          found: false,
+          restorable: false,
+          configured: true,
+        });
+      }
+
+      const guesses =
+        decryptKotobaruGuesses(
+          record.guessesEncrypted
+        );
+
+      if (
+        !Array.isArray(
+          guesses
+        ) ||
+        guesses.length === 0
+      ) {
+        /*
+         * 旧形式など、色だけ残っていて単語を復元できない記録。
+         * 他人の単語や推測値で穴埋めはしません。
+         */
+        return res.json({
+          ok: true,
+          found: true,
+          restorable: false,
+          configured: true,
+          finished:
+            Boolean(
+              record.finished
+            ),
+          won:
+            Boolean(
+              record.won
+            ),
+          updatedAt:
+            record.updatedAt ||
+            record.savedAt ||
+            null,
+        });
+      }
+
+      console.log(
+        `ことばル盤面復元: user=${discordUser.id} / date=${date} / ${guesses.length}手`
+      );
+
+      return res.json({
+        ok: true,
+        found: true,
+        restorable: true,
+        configured: true,
+        date:
+          record.date,
+        puzzleNumber:
+          record.puzzleNumber,
+        guesses,
+        finished:
+          Boolean(
+            record.finished
+          ),
+        won:
+          Boolean(
+            record.won
+          ),
+        updatedAt:
+          record.updatedAt ||
+          record.savedAt ||
+          null,
+      });
+    } catch (error) {
+      console.error(
+        "ことばル盤面復元エラー:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          error:
+            "restore failed",
         });
     }
   }
