@@ -107,91 +107,93 @@ function wait(
 
 async function discordRest(
   endpoint,
-  options = {},
-  attempt = 1
+  options = {}
 ) {
-  if (
-    !KOTOBARU_BOT_TOKEN
-  ) {
+  if (!KOTOBARU_BOT_TOKEN) {
     throw new Error(
       "KOTOBARU_DISCORD_TOKEN がありません"
     );
   }
 
-  const response =
-    await fetch(
-      `${DISCORD_API}${endpoint}`,
-      {
-        ...options,
-
-        headers: {
-          Authorization:
-            `Bot ${KOTOBARU_BOT_TOKEN}`,
-
-          "Content-Type":
-            "application/json",
-
-          ...(options.headers ||
-            {}),
-        },
-      }
-    );
-
   /*
-   * Discordの429
-   * Rate Limit
+   * v15.2:
+   * Discord RESTはRenderの共有Outbound IPから直接送らず、
+   * 原則Cloudflare Worker経由にします。
+   * Discord公式が警告している「クラウドの動的共有IPが
+   * 一時BANを引き継ぐ」問題の影響範囲を小さくするためです。
    */
   if (
-    response.status ===
-      429 &&
-    attempt <= 5
+    KOTOBARU_DATA_URL &&
+    KOTOBARU_DATA_INTERNAL_SECRET
   ) {
-    let retryAfter =
-      2;
-
     try {
-      const data =
-        await response.json();
+      return await kotobaruDataInternal(
+        "/internal/discord-json",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            endpoint,
+            method:
+              options.method ||
+              "GET",
+            body:
+              options.body ?? null,
+          }),
+        }
+      );
+    } catch (error) {
+      console.warn(
+        "Cloudflare経由Discord REST通信失敗。Render直通へは自動フォールバックしません:",
+        error?.message || error
+      );
 
-      retryAfter =
-        Number(
-          data.retry_after
-        ) || 2;
-    } catch {
-      // JSONでなくても2秒待つ
+      /*
+       * ここでRender直通へ自動フォールバックすると、
+       * 共有IPがDiscordから制限されている最中に無効リクエストを
+       * 追加する可能性があります。明示的に503を返して後で再試行します。
+       */
+      return new Response(
+        JSON.stringify({
+          error:
+            "Discord REST proxy unavailable",
+        }),
+        {
+          status: 503,
+          headers: {
+            "content-type":
+              "application/json",
+          },
+        }
+      );
     }
-
-    console.warn(
-      `Discord REST Rate Limit。${retryAfter}秒待って再試行します。`
-    );
-
-    await wait(
-      Math.ceil(
-        retryAfter *
-          1000
-      )
-    );
-
-    return discordRest(
-      endpoint,
-      options,
-      attempt + 1
-    );
   }
 
-  return response;
+  /*
+   * D1 Worker未設定時だけ後方互換として直通します。
+   * 429はその場で連打せず、そのまま呼び出し元へ返します。
+   */
+  return fetch(
+    `${DISCORD_API}${endpoint}`,
+    {
+      ...options,
+      headers: {
+        Authorization:
+          `Bot ${KOTOBARU_BOT_TOKEN}`,
+        "Content-Type":
+          "application/json",
+        ...(options.headers || {}),
+      },
+    }
+  );
 }
 
 async function discordRestMultipart(
   endpoint,
   method,
   payload,
-  files = [],
-  attempt = 1
+  files = []
 ) {
-  if (
-    !KOTOBARU_BOT_TOKEN
-  ) {
+  if (!KOTOBARU_BOT_TOKEN) {
     throw new Error(
       "KOTOBARU_DISCORD_TOKEN がありません"
     );
@@ -222,59 +224,59 @@ async function discordRestMultipart(
     }
   );
 
-  const response =
-    await fetch(
-      `${DISCORD_API}${endpoint}`,
-      {
-        method,
-        headers: {
-          Authorization:
-            `Bot ${KOTOBARU_BOT_TOKEN}`,
-        },
-        body: form,
-      }
-    );
-
   if (
-    response.status ===
-      429 &&
-    attempt <= 5
+    KOTOBARU_DATA_URL &&
+    KOTOBARU_DATA_INTERNAL_SECRET
   ) {
-    let retryAfter = 2;
-
     try {
-      const data =
-        await response.json();
+      return await fetch(
+        `${KOTOBARU_DATA_URL}/internal/discord-multipart`,
+        {
+          method: "POST",
+          headers: {
+            "X-Kotobaru-Internal":
+              KOTOBARU_DATA_INTERNAL_SECRET,
+            "X-Discord-Endpoint":
+              endpoint,
+            "X-Discord-Method":
+              method,
+          },
+          body: form,
+        }
+      );
+    } catch (error) {
+      console.warn(
+        "Cloudflare経由Discord Multipart通信失敗:",
+        error?.message || error
+      );
 
-      retryAfter =
-        Number(
-          data.retry_after
-        ) || 2;
-    } catch {
-      // JSONでなくても2秒待つ
+      return new Response(
+        JSON.stringify({
+          error:
+            "Discord multipart proxy unavailable",
+        }),
+        {
+          status: 503,
+          headers: {
+            "content-type":
+              "application/json",
+          },
+        }
+      );
     }
-
-    console.warn(
-      `Discord REST Rate Limit。${retryAfter}秒待って再試行します。`
-    );
-
-    await wait(
-      Math.ceil(
-        retryAfter *
-          1000
-      )
-    );
-
-    return discordRestMultipart(
-      endpoint,
-      method,
-      payload,
-      files,
-      attempt + 1
-    );
   }
 
-  return response;
+  return fetch(
+    `${DISCORD_API}${endpoint}`,
+    {
+      method,
+      headers: {
+        Authorization:
+          `Bot ${KOTOBARU_BOT_TOKEN}`,
+      },
+      body: form,
+    }
+  );
 }
 
 async function kotobaruDataInternal(
@@ -5638,9 +5640,29 @@ async function registerKotobaruCommandsForGuild(
   guild
 ) {
   try {
-    await guild.commands.set(
-      kotobaruCommands
-    );
+    if (!KOTOBARU_CLIENT_ID) {
+      throw new Error(
+        "KOTOBARU_DISCORD_CLIENT_ID がありません"
+      );
+    }
+
+    const response =
+      await discordRest(
+        `/applications/${KOTOBARU_CLIENT_ID}/guilds/${guild.id}/commands`,
+        {
+          method: "PUT",
+          body:
+            JSON.stringify(
+              kotobaruCommands
+            ),
+        }
+      );
+
+    if (!response.ok) {
+      throw new Error(
+        `HTTP ${response.status}: ${await response.text().catch(() => "")}`
+      );
+    }
 
     console.log(
       `ことばルコマンド同期完了: ${guild.name}`
@@ -5679,8 +5701,8 @@ kotobaruBot.on(
       guild
     );
 
-    await refreshKotobaruGuildConfig(
-      guild
+    await getKotobaruGuildConfig(
+      guild.id
     ).catch(
       () => null
     );
@@ -6722,6 +6744,79 @@ app.get(
           KOTOBARU_DATA_URL &&
           KOTOBARU_DATA_INTERNAL_SECRET
         ),
+
+      discordRestViaWorker:
+        Boolean(
+          KOTOBARU_DATA_URL &&
+          KOTOBARU_DATA_INTERNAL_SECRET
+        ),
+
+      gatewayConnecting:
+        kotobaruGatewayConnecting,
+
+      gatewayRetryAttempt:
+        kotobaruGatewayAttempt,
+
+      gatewayLastError:
+        kotobaruGatewayLastError,
+    });
+  }
+);
+
+app.get(
+  "/api/kotobaru/diagnostics",
+  async (_req, res) => {
+    let dataWorker = null;
+
+    if (KOTOBARU_DATA_URL) {
+      try {
+        const response =
+          await fetch(
+            `${KOTOBARU_DATA_URL}/health`,
+            {
+              headers: {
+                "cache-control":
+                  "no-store",
+              },
+            }
+          );
+
+        dataWorker =
+          await response
+            .json()
+            .catch(
+              () => ({
+                ok: false,
+                status:
+                  response.status,
+              })
+            );
+      } catch (error) {
+        dataWorker = {
+          ok: false,
+          error:
+            error?.message ||
+            String(error),
+        };
+      }
+    }
+
+    res.json({
+      ok: true,
+      gatewayReady:
+        kotobaruBot.isReady(),
+      gatewayConnecting:
+        kotobaruGatewayConnecting,
+      gatewayRetryAttempt:
+        kotobaruGatewayAttempt,
+      gatewayLastError:
+        kotobaruGatewayLastError,
+      discordRestViaWorker:
+        Boolean(
+          KOTOBARU_DATA_URL &&
+          KOTOBARU_DATA_INTERNAL_SECRET
+        ),
+      dataWorker,
     });
   }
 );
@@ -7064,7 +7159,7 @@ function scheduleKotobaruLaunchCleanup(
   }
 
   const windowMs =
-    40000;
+    8000;
 
   launchCleanupScheduledUntil.set(
     channelId,
@@ -7078,9 +7173,6 @@ function scheduleKotobaruLaunchCleanup(
    */
   const delays = [
     0,
-    4000,
-    12000,
-    25000,
   ];
 
   for (
@@ -7119,6 +7211,57 @@ function scheduleKotobaruLaunchCleanup(
   );
 }
 
+async function refreshLatestKotobaruPreviewFromD1(
+  guildId,
+  date = jstDateKey()
+) {
+  try {
+    const data =
+      await loadKotobaruD1Day(
+        guildId,
+        date
+      );
+
+    const entries =
+      Array.isArray(data.entries)
+        ? data.entries
+        : [];
+
+    if (!entries.length) {
+      return false;
+    }
+
+    const latest =
+      [...entries].sort(
+        (a, b) =>
+          Number(b.updatedAt || 0) -
+          Number(a.updatedAt || 0)
+      )[0];
+
+    if (
+      !latest?.sessionId ||
+      !Number.isInteger(
+        Number(latest.puzzleNumber)
+      )
+    ) {
+      return false;
+    }
+
+    return await upsertKotobaruLiveCardFromD1(
+      guildId,
+      date,
+      Number(latest.puzzleNumber),
+      latest.sessionId
+    );
+  } catch (error) {
+    console.warn(
+      "ことばル起動時Preview再同期失敗:",
+      error?.message || error
+    );
+    return false;
+  }
+}
+
 app.post(
   "/api/kotobaru/awake",
   async (req, res) => {
@@ -7141,78 +7284,87 @@ app.post(
         });
     }
 
-    try {
-      console.log(
-        `ことばル awake受信: guild=${guildId} / activityChannel=${channelId || "なし"}`
-      );
+    console.log(
+      `ことばル awake受信: guild=${guildId} / activityChannel=${channelId || "なし"}`
+    );
 
-      /*
-       * 昨日の結果確認はREST APIで行うため、
-       * Discord GatewayのReady待ちは不要です。
-       */
-      const summary =
+    /*
+     * 起動応答をDiscord日次集計やPreview更新で待たせません。
+     * Render起床直後でもまず200を返し、重い同期処理は後ろで実行します。
+     */
+    res.json({
+      ok: true,
+      gatewayReady:
+        kotobaruBot.isReady(),
+      gatewayConnecting:
+        kotobaruGatewayConnecting,
+      discordRestViaWorker:
+        Boolean(
+          KOTOBARU_DATA_URL &&
+          KOTOBARU_DATA_INTERNAL_SECRET
+        ),
+    });
+
+    void (async () => {
+      try {
         await ensureYesterdaySummaryForGuildFromD1(
           guildId
         );
-
-      /*
-       * Activity SDK の channelId と、ことばル設定の表示先チャンネルが
-       * 必ずしも同じとは限りません。
-       *
-       * Play now! はPreviewのある表示先から押されるため、
-       * 設定済みの summaryChannelId も必ず走査対象へ含めます。
-       */
-      const config =
-        await getKotobaruGuildConfig(
-          guildId
-        );
-
-      const cleanupChannels =
-        new Set(
-          [
-            channelId,
-            config?.summaryChannelId,
-          ].filter(Boolean)
-        );
-
-      console.log(
-        "ことばル起動カード整理対象:",
-        JSON.stringify(
-          [...cleanupChannels]
-        )
-      );
-
-      for (
-        const cleanupChannelId of
-        cleanupChannels
-      ) {
-        scheduleKotobaruLaunchCleanup(
-          cleanupChannelId
+      } catch (error) {
+        console.warn(
+          "ことばル起動時の日次集計確認失敗:",
+          error?.message || error
         );
       }
 
-      return res.json({
-        ok: true,
-        gatewayReady:
-          kotobaruBot.isReady(),
-        cleanupChannels:
-          [...cleanupChannels],
-        summary,
-      });
-    } catch (error) {
-      console.error(
-        "ことばル起動確認エラー:",
-        error
-      );
+      try {
+        await refreshLatestKotobaruPreviewFromD1(
+          guildId,
+          jstDateKey()
+        );
+      } catch (error) {
+        console.warn(
+          "ことばル起動時Preview確認失敗:",
+          error?.message || error
+        );
+      }
 
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          gatewayReady:
-            kotobaruBot.isReady(),
-        });
-    }
+      try {
+        const config =
+          await getKotobaruGuildConfig(
+            guildId
+          );
+
+        const cleanupChannels =
+          new Set(
+            [
+              channelId,
+              config?.summaryChannelId,
+            ].filter(Boolean)
+          );
+
+        console.log(
+          "ことばル起動カード整理対象:",
+          JSON.stringify(
+            [...cleanupChannels]
+          )
+        );
+
+        for (
+          const cleanupChannelId of
+          cleanupChannels
+        ) {
+          scheduleKotobaruLaunchCleanup(
+            cleanupChannelId
+          );
+        }
+      } catch (error) {
+        console.warn(
+          "ことばル起動後処理失敗:",
+          error?.message || error
+        );
+      }
+    })();
   }
 );
 
@@ -7242,6 +7394,93 @@ cron.schedule(
 /* =========================================================
  * ことばルBot起動
  * ======================================================= */
+let kotobaruGatewayAttempt = 0;
+let kotobaruGatewayRetryTimer = null;
+let kotobaruGatewayLastError = null;
+let kotobaruGatewayConnecting = false;
+
+async function connectKotobaruGatewayWithRetry() {
+  if (
+    !KOTOBARU_BOT_TOKEN ||
+    kotobaruBot.isReady() ||
+    kotobaruGatewayConnecting
+  ) {
+    return;
+  }
+
+  kotobaruGatewayConnecting = true;
+  kotobaruGatewayAttempt += 1;
+
+  console.log(
+    `Discord Gateway接続を試行します (${kotobaruGatewayAttempt}回目)...`
+  );
+
+  try {
+    await kotobaruBot.login(
+      KOTOBARU_BOT_TOKEN
+    );
+
+    kotobaruGatewayLastError = null;
+    kotobaruGatewayAttempt = 0;
+
+    console.log(
+      "Discord login() 処理完了"
+    );
+  } catch (error) {
+    kotobaruGatewayLastError =
+      error?.message ||
+      String(error);
+
+    console.error(
+      "ことばルBotログイン失敗:",
+      error
+    );
+
+    /*
+     * v15以前は初回login失敗後に再試行しなかったため、
+     * Render起動時にDiscord側の一時制限へ当たると
+     * 次のデプロイまでBotがオフラインのままでした。
+     */
+    const delays = [
+      30_000,
+      90_000,
+      3 * 60_000,
+      5 * 60_000,
+      10 * 60_000,
+      15 * 60_000,
+    ];
+
+    const delay =
+      delays[
+        Math.min(
+          kotobaruGatewayAttempt - 1,
+          delays.length - 1
+        )
+      ];
+
+    console.warn(
+      `ことばルGatewayを${Math.round(delay / 1000)}秒後に再試行します。`
+    );
+
+    if (kotobaruGatewayRetryTimer) {
+      clearTimeout(
+        kotobaruGatewayRetryTimer
+      );
+    }
+
+    kotobaruGatewayRetryTimer =
+      setTimeout(
+        () => {
+          kotobaruGatewayRetryTimer = null;
+          void connectKotobaruGatewayWithRetry();
+        },
+        delay
+      );
+  } finally {
+    kotobaruGatewayConnecting = false;
+  }
+}
+
 async function startKotobaruBot() {
   if (!KOTOBARU_BOT_TOKEN) {
     console.warn(
@@ -7267,9 +7506,6 @@ async function startKotobaruBot() {
     }`
   );
 
-  /*
-   * BotがDiscordに接続できたとき
-   */
   kotobaruBot.once(
     Events.ClientReady,
     async (readyClient) => {
@@ -7277,9 +7513,9 @@ async function startKotobaruBot() {
         `ことばル Bot ready: ${readyClient.user.tag}`
       );
 
-      /*
-       * スラッシュコマンド同期
-       */
+      kotobaruGatewayLastError = null;
+      kotobaruGatewayAttempt = 0;
+
       try {
         await registerKotobaruCommands();
       } catch (error) {
@@ -7290,14 +7526,15 @@ async function startKotobaruBot() {
       }
 
       /*
-       * Discordチャンネルから設定復元
+       * 設定取得もDiscord.jsのREST直通ではなく、
+       * getKotobaruGuildConfig -> Cloudflare REST proxy経由にします。
        */
       for (
         const guild of
         readyClient.guilds.cache.values()
       ) {
-        await refreshKotobaruGuildConfig(
-          guild
+        await getKotobaruGuildConfig(
+          guild.id
         ).catch(
           (error) => {
             console.error(
@@ -7310,12 +7547,13 @@ async function startKotobaruBot() {
     }
   );
 
-  /*
-   * Discord Clientエラー
-   */
   kotobaruBot.on(
     Events.Error,
     (error) => {
+      kotobaruGatewayLastError =
+        error?.message ||
+        String(error);
+
       console.error(
         "ことばルDiscord Client Error:",
         error
@@ -7323,42 +7561,7 @@ async function startKotobaruBot() {
     }
   );
 
-  console.log(
-    "Discord Gatewayへ接続を開始します..."
-  );
-
-  /*
-   * 90秒経ってもReadyにならない場合だけ警告
-   */
-  const timeout = setTimeout(
-    () => {
-      if (!kotobaruBot.isReady()) {
-        console.warn(
-          "ことばルBot: 90秒経過してもDiscord Gatewayへの接続が完了していません。"
-        );
-      }
-    },
-    90000
-  );
-
-  try {
-    await kotobaruBot.login(
-      KOTOBARU_BOT_TOKEN
-    );
-
-    clearTimeout(timeout);
-
-    console.log(
-      "Discord login() 処理完了"
-    );
-  } catch (error) {
-    clearTimeout(timeout);
-
-    console.error(
-      "ことばルBotログイン失敗:",
-      error
-    );
-  }
+  await connectKotobaruGatewayWithRetry();
 }
 
 
