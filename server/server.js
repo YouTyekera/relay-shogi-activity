@@ -70,6 +70,18 @@ const KOTOBARU_CRON_SECRET =
   process.env.KOTOBARU_CRON_SECRET?.trim() ||
   "";
 
+/*
+ * Cloudflare D1 Worker。
+ * ゲーム状態の正本はDiscord LOGではなくD1へ移します。
+ */
+const KOTOBARU_DATA_URL =
+  process.env.KOTOBARU_DATA_URL?.trim()?.replace(/\/$/, "") ||
+  "";
+
+const KOTOBARU_DATA_INTERNAL_SECRET =
+  process.env.KOTOBARU_DATA_INTERNAL_SECRET?.trim() ||
+  "";
+
 /* =========================================================
  * Discord REST API
  *
@@ -263,6 +275,109 @@ async function discordRestMultipart(
   }
 
   return response;
+}
+
+async function kotobaruDataInternal(
+  pathname,
+  options = {}
+) {
+  if (
+    !KOTOBARU_DATA_URL ||
+    !KOTOBARU_DATA_INTERNAL_SECRET
+  ) {
+    throw new Error(
+      "KOTOBARU_DATA_URL / KOTOBARU_DATA_INTERNAL_SECRET が未設定です"
+    );
+  }
+
+  const response =
+    await fetch(
+      `${KOTOBARU_DATA_URL}${pathname}`,
+      {
+        ...options,
+        headers: {
+          "Content-Type":
+            "application/json",
+          "X-Kotobaru-Internal":
+            KOTOBARU_DATA_INTERNAL_SECRET,
+          ...(options.headers || {}),
+        },
+      }
+    );
+
+  return response;
+}
+
+async function syncKotobaruConfigToD1(
+  config
+) {
+  if (!config) {
+    return false;
+  }
+
+  try {
+    const response =
+      await kotobaruDataInternal(
+        "/internal/config",
+        {
+          method: "POST",
+          body:
+            JSON.stringify(config),
+        }
+      );
+
+    if (!response.ok) {
+      console.warn(
+        "ことばルD1設定同期失敗:",
+        response.status,
+        await response.text().catch(() => "")
+      );
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.warn(
+      "ことばルD1設定同期通信失敗:",
+      error
+    );
+    return false;
+  }
+}
+
+async function getKotobaruConfigFromD1(
+  guildId
+) {
+  if (
+    !KOTOBARU_DATA_URL ||
+    !KOTOBARU_DATA_INTERNAL_SECRET
+  ) {
+    return null;
+  }
+
+  try {
+    const query =
+      new URLSearchParams({
+        guildId,
+      });
+
+    const response =
+      await kotobaruDataInternal(
+        `/internal/config?${query.toString()}`
+      );
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const data =
+      await response.json();
+
+    return data.config ||
+      null;
+  } catch {
+    return null;
+  }
 }
 
   /* =========================================================
@@ -1458,6 +1573,10 @@ async function refreshKotobaruGuildConfig(
     newest
   );
 
+  await syncKotobaruConfigToD1(
+    newest
+  ).catch(() => false);
+
   return newest;
 }
 
@@ -1471,6 +1590,20 @@ async function getKotobaruGuildConfig(
 
   if (cached) {
     return cached;
+  }
+
+  const d1Config =
+    await getKotobaruConfigFromD1(
+      guildId
+    );
+
+  if (d1Config) {
+    guildConfigs.set(
+      guildId,
+      d1Config
+    );
+
+    return d1Config;
   }
 
   try {
@@ -1575,6 +1708,10 @@ async function getKotobaruGuildConfig(
       guildId,
       newest
     );
+
+    await syncKotobaruConfigToD1(
+      newest
+    ).catch(() => false);
 
     return newest;
 
@@ -3929,6 +4066,609 @@ async function renderKotobaruWordsPng(
     .asPng();
 }
 
+async function loadKotobaruD1Session(
+  guildId,
+  date,
+  sessionId
+) {
+  const query =
+    new URLSearchParams({
+      guildId,
+      date,
+      sessionId,
+    });
+
+  const response =
+    await kotobaruDataInternal(
+      `/internal/session?${query.toString()}`
+    );
+
+  if (!response.ok) {
+    throw new Error(
+      `D1 session read failed: HTTP ${response.status}`
+    );
+  }
+
+  return response.json();
+}
+
+async function loadKotobaruD1Day(
+  guildId,
+  date
+) {
+  const query =
+    new URLSearchParams({
+      guildId,
+      date,
+    });
+
+  const response =
+    await kotobaruDataInternal(
+      `/internal/day?${query.toString()}`
+    );
+
+  if (!response.ok) {
+    throw new Error(
+      `D1 day read failed: HTTP ${response.status}`
+    );
+  }
+
+  return response.json();
+}
+
+async function updateKotobaruD1SessionMessage(
+  guildId,
+  date,
+  sessionId,
+  messageId
+) {
+  const response =
+    await kotobaruDataInternal(
+      "/internal/session-message",
+      {
+        method: "POST",
+        body:
+          JSON.stringify({
+            guildId,
+            date,
+            sessionId,
+            messageId,
+          }),
+      }
+    );
+
+  return response.ok;
+}
+
+async function upsertKotobaruLiveCardFromD1(
+  guildId,
+  date,
+  puzzleNumber,
+  sessionId
+) {
+  const data =
+    await loadKotobaruD1Session(
+      guildId,
+      date,
+      sessionId
+    );
+
+  const entries =
+    Array.isArray(data.entries)
+      ? data.entries
+      : [];
+
+  if (!entries.length) {
+    return false;
+  }
+
+  const config =
+    data.settings ||
+    await getKotobaruGuildConfig(
+      guildId
+    );
+
+  if (!config?.summaryChannelId) {
+    return false;
+  }
+
+  const payload =
+    buildKotobaruLiveCardPayload(
+      entries,
+      puzzleNumber,
+      date,
+      true
+    );
+
+  const previewPng =
+    await renderKotobaruPreviewPng(
+      entries,
+      puzzleNumber,
+      guildId
+    );
+
+  const files = [
+    {
+      name: "preview.png",
+      data: previewPng,
+      contentType:
+        "image/png",
+    },
+  ];
+
+  const currentMessageId =
+    data.session?.messageId ||
+    null;
+
+  if (currentMessageId) {
+    const editPayload = {
+      ...payload,
+    };
+
+    delete editPayload.flags;
+
+    const editResponse =
+      await discordRestMultipart(
+        `/channels/${config.summaryChannelId}/messages/${currentMessageId}`,
+        "PATCH",
+        editPayload,
+        files
+      );
+
+    if (editResponse.ok) {
+      return true;
+    }
+
+    console.warn(
+      "D1ベースPreview更新失敗。再作成します:",
+      editResponse.status
+    );
+  }
+
+  const createResponse =
+    await discordRestMultipart(
+      `/channels/${config.summaryChannelId}/messages`,
+      "POST",
+      payload,
+      files
+    );
+
+  if (!createResponse.ok) {
+    console.warn(
+      "D1ベースPreview作成失敗:",
+      createResponse.status,
+      await createResponse.text().catch(() => "")
+    );
+    return false;
+  }
+
+  const created =
+    await createResponse.json();
+
+  await updateKotobaruD1SessionMessage(
+    guildId,
+    date,
+    sessionId,
+    created.id
+  ).catch(() => false);
+
+  return true;
+}
+
+async function getKotobaruD1SummaryStatus(
+  guildId,
+  date
+) {
+  const query =
+    new URLSearchParams({
+      guildId,
+      date,
+    });
+
+  const response =
+    await kotobaruDataInternal(
+      `/internal/summary-status?${query.toString()}`
+    );
+
+  if (!response.ok) {
+    return false;
+  }
+
+  const data =
+    await response.json();
+
+  return Boolean(
+    data.posted
+  );
+}
+
+async function markKotobaruD1SummaryPosted(
+  guildId,
+  date
+) {
+  const response =
+    await kotobaruDataInternal(
+      "/internal/summary-posted",
+      {
+        method: "POST",
+        body:
+          JSON.stringify({
+            guildId,
+            date,
+          }),
+      }
+    );
+
+  return response.ok;
+}
+
+async function postKotobaruSummaryForGuildFromD1(
+  guildId,
+  date = previousJstDateKey()
+) {
+  const data =
+    await loadKotobaruD1Day(
+      guildId,
+      date
+    );
+
+  const records =
+    Array.isArray(data.entries)
+      ? data.entries
+      : [];
+
+  if (!records.length) {
+    return false;
+  }
+
+  const config =
+    data.settings ||
+    await getKotobaruGuildConfig(
+      guildId
+    );
+
+  if (!config?.summaryChannelId) {
+    return false;
+  }
+
+  const puzzleNumber =
+    Math.max(
+      ...records.map(
+        (record) =>
+          Number(
+            record.puzzleNumber
+          ) || 1
+      )
+    );
+
+  const sorted =
+    [...records].sort(
+      (a, b) => {
+        if (a.won !== b.won) {
+          return a.won
+            ? -1
+            : 1;
+        }
+
+        if (
+          a.won &&
+          b.won &&
+          a.attempts !==
+            b.attempts
+        ) {
+          return (
+            a.attempts -
+            b.attempts
+          );
+        }
+
+        if (
+          Boolean(a.finished) !==
+          Boolean(b.finished)
+        ) {
+          return a.finished
+            ? -1
+            : 1;
+        }
+
+        return (
+          Number(a.savedAt || a.updatedAt || 0) -
+          Number(b.savedAt || b.updatedAt || 0)
+        );
+      }
+    );
+
+  const entries =
+    sorted.map(
+      (record) => ({
+        ...record,
+        historical: true,
+      })
+    );
+
+  const previewPng =
+    await renderKotobaruPreviewPng(
+      entries,
+      puzzleNumber,
+      guildId
+    );
+
+  const wordsPng =
+    await renderKotobaruWordsPng(
+      entries,
+      puzzleNumber,
+      guildId
+    );
+
+  const payload = {
+    content:
+      `**ことばル 第${puzzleNumber}問　昨日の結果**`,
+    embeds: [
+      {
+        title:
+          "昨日の順位",
+        description:
+          `${sorted.length}人が挑戦しました。`,
+        color:
+          0x4aa340,
+        image: {
+          url:
+            "attachment://preview.png",
+        },
+        footer: {
+          text: date,
+        },
+      },
+      {
+        title:
+          "みんなが使ったことば",
+        color:
+          0x4aa340,
+        image: {
+          url:
+            "attachment://words.png",
+        },
+      },
+    ],
+    attachments: [
+      {
+        id: 0,
+        filename:
+          "preview.png",
+        description:
+          "ことばルの昨日の順位",
+      },
+      {
+        id: 1,
+        filename:
+          "words.png",
+        description:
+          "ことばルで昨日使われたことば",
+      },
+    ],
+    components:
+      activityLinkButton(
+        "Play now!"
+      ),
+    flags:
+      SUPPRESS_NOTIFICATIONS_FLAG,
+  };
+
+  const response =
+    await discordRestMultipart(
+      `/channels/${config.summaryChannelId}/messages`,
+      "POST",
+      payload,
+      [
+        {
+          name:
+            "preview.png",
+          data:
+            previewPng,
+          contentType:
+            "image/png",
+        },
+        {
+          name:
+            "words.png",
+          data:
+            wordsPng,
+          contentType:
+            "image/png",
+        },
+      ]
+    );
+
+  if (!response.ok) {
+    console.warn(
+      "D1昨日結果投稿失敗:",
+      response.status,
+      await response.text().catch(() => "")
+    );
+    return false;
+  }
+
+  await markKotobaruD1SummaryPosted(
+    guildId,
+    date
+  ).catch(() => false);
+
+  return true;
+}
+
+async function ensureYesterdaySummaryForGuildFromD1(
+  guildId
+) {
+  const date =
+    previousJstDateKey();
+
+  if (
+    await getKotobaruD1SummaryStatus(
+      guildId,
+      date
+    )
+  ) {
+    return {
+      configured: true,
+      posted: false,
+      alreadyDone: true,
+    };
+  }
+
+  const posted =
+    await postKotobaruSummaryForGuildFromD1(
+      guildId,
+      date
+    );
+
+  return {
+    configured: true,
+    posted,
+    alreadyDone: false,
+  };
+}
+
+async function runYesterdaySummariesForAllGuildsFromD1() {
+  const response =
+    await kotobaruDataInternal(
+      "/internal/configs"
+    );
+
+  if (!response.ok) {
+    throw new Error(
+      `D1 config list failed: HTTP ${response.status}`
+    );
+  }
+
+  const data =
+    await response.json();
+
+  const results = [];
+
+  for (
+    const config of
+    data.configs || []
+  ) {
+    try {
+      const result =
+        await ensureYesterdaySummaryForGuildFromD1(
+          config.guildId
+        );
+
+      results.push({
+        guildId:
+          config.guildId,
+        ...result,
+      });
+    } catch (error) {
+      results.push({
+        guildId:
+          config.guildId,
+        error:
+          String(error?.message || error),
+      });
+    }
+  }
+
+  return results;
+}
+
+async function migrateLegacyKotobaruDayToD1(
+  guildId,
+  date
+) {
+  const records =
+    await loadKotobaruParticipantsForDate(
+      guildId,
+      date
+    );
+
+  let imported = 0;
+  let failed = 0;
+
+  for (
+    const record of
+    records
+  ) {
+    try {
+      const guesses =
+        decryptKotobaruGuesses(
+          record.guessesEncrypted
+        );
+
+      const updatedAt =
+        new Date(
+          record.updatedAt ||
+          record.savedAt ||
+          Date.now()
+        ).getTime();
+
+      const response =
+        await kotobaruDataInternal(
+          "/internal/import-play",
+          {
+            method: "POST",
+            body:
+              JSON.stringify({
+                guildId:
+                  record.guildId || guildId,
+                userId:
+                  record.userId,
+                date:
+                  record.date || date,
+                puzzleNumber:
+                  record.puzzleNumber,
+                displayName:
+                  record.displayName,
+                avatarHash:
+                  record.avatarHash ?? null,
+                sessionId:
+                  record.sessionId ||
+                  `legacy-${date}`,
+                pattern:
+                  record.pattern || [],
+                guesses:
+                  Array.isArray(guesses)
+                    ? guesses
+                    : [],
+                finished:
+                  Boolean(record.finished),
+                won:
+                  Boolean(record.won),
+                attempts:
+                  record.attempts ?? null,
+                updatedAt,
+                savedAt:
+                  record.savedAt
+                    ? new Date(record.savedAt).getTime()
+                    : null,
+              }),
+          }
+        );
+
+      if (response.ok) {
+        imported += 1;
+      } else {
+        failed += 1;
+      }
+    } catch (error) {
+      failed += 1;
+      console.warn(
+        "旧ことばルLOGのD1移行失敗:",
+        error
+      );
+    }
+  }
+
+  return {
+    date,
+    found:
+      records.length,
+    imported,
+    failed,
+  };
+}
+
 async function upsertKotobaruLiveCard(
   guildId,
   date,
@@ -4745,6 +5485,10 @@ async function createKotobaruSetup(
     config
   );
 
+  await syncKotobaruConfigToD1(
+    config
+  ).catch(() => false);
+
   await interaction.editReply(
     [
       "ことばルの設定が完了しました。",
@@ -4870,6 +5614,17 @@ const kotobaruCommands = [
     )
     .setDescription(
       "昨日の結果をテスト投稿します"
+    )
+    .setDefaultMemberPermissions(
+      PermissionFlagsBits.ManageChannels
+    ),
+
+  new SlashCommandBuilder()
+    .setName(
+      "ことばルd1移行"
+    )
+    .setDescription(
+      "旧Discord LOGの今日・昨日分をD1へ移行します"
     )
     .setDefaultMemberPermissions(
       PermissionFlagsBits.ManageChannels
@@ -5053,7 +5808,7 @@ kotobaruBot.on(
         });
 
         const posted =
-          await postKotobaruSummaryForGuild(
+          await postKotobaruSummaryForGuildFromD1(
             interaction.guild.id
           );
 
@@ -5062,6 +5817,52 @@ kotobaruBot.on(
             ? "前日の結果を投稿しました。"
             : "前日分の記録がありません。"
         );
+
+        return;
+      }
+
+      if (
+        interaction.commandName ===
+        "ことばルd1移行"
+      ) {
+        if (!interaction.guild) {
+          return;
+        }
+
+        await interaction.deferReply({
+          ephemeral: true,
+        });
+
+        const today =
+          jstDateKey();
+        const yesterday =
+          previousJstDateKey();
+
+        const results = [];
+
+        for (
+          const date of
+          [yesterday, today]
+        ) {
+          results.push(
+            await migrateLegacyKotobaruDayToD1(
+              interaction.guild.id,
+              date
+            )
+          );
+        }
+
+        await interaction.editReply(
+          [
+            "D1移行を実行しました。",
+            ...results.map(
+              (result) =>
+                `${result.date}: 検出${result.found}件 / 移行${result.imported}件 / 失敗${result.failed}件`
+            ),
+          ].join("\n")
+        );
+
+        return;
       }
     } catch (error) {
       console.error(
@@ -5732,6 +6533,68 @@ app.post(
 );
 
 /* =========================================================
+ * D1保存済みデータからDiscord Previewだけを後追い同期
+ *
+ * ゲームデータ保存はCloudflare D1で完了済みなので、
+ * Discordが429でも回答自体は失われません。
+ * ======================================================= */
+
+app.post(
+  "/api/kotobaru/preview-sync",
+  async (req, res) => {
+    const {
+      guildId,
+      date,
+      puzzleNumber,
+      sessionId,
+    } = req.body || {};
+
+    if (
+      typeof guildId !== "string" ||
+      typeof date !== "string" ||
+      !Number.isInteger(puzzleNumber) ||
+      typeof sessionId !== "string"
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "invalid preview sync request",
+        });
+    }
+
+    try {
+      const updated =
+        await upsertKotobaruLiveCardFromD1(
+          guildId,
+          date,
+          puzzleNumber,
+          sessionId
+        );
+
+      return res.json({
+        ok: true,
+        updated,
+      });
+    } catch (error) {
+      console.warn(
+        "ことばルD1 Preview同期失敗:",
+        error
+      );
+
+      /*
+       * Preview失敗はゲーム保存失敗ではないため200で返します。
+       * 次回回答・awake・日次処理で再同期できます。
+       */
+      return res.json({
+        ok: true,
+        updated: false,
+      });
+    }
+  }
+);
+
+/* =========================================================
  * Cloudflare Cron Worker用 日次集計エンドポイント
  *
  * Render Freeが寝ている時間でも、Cloudflare CronがこのURLを叩くことで
@@ -5782,7 +6645,7 @@ app.post(
       );
 
       const results =
-        await runYesterdaySummariesForAllGuilds();
+        await runYesterdaySummariesForAllGuildsFromD1();
 
       console.log(
         "ことばル Cloudflare Cron日次集計完了:",
@@ -5852,6 +6715,12 @@ app.get(
       cronConfigured:
         Boolean(
           KOTOBARU_CRON_SECRET
+        ),
+
+      d1Configured:
+        Boolean(
+          KOTOBARU_DATA_URL &&
+          KOTOBARU_DATA_INTERNAL_SECRET
         ),
     });
   }
@@ -6282,7 +7151,7 @@ app.post(
        * Discord GatewayのReady待ちは不要です。
        */
       const summary =
-        await ensureYesterdaySummaryForGuild(
+        await ensureYesterdaySummaryForGuildFromD1(
           guildId
         );
 
@@ -6354,7 +7223,7 @@ app.post(
 cron.schedule(
   "5 0 * * *",
   () => {
-    runYesterdaySummariesForAllGuilds()
+    runYesterdaySummariesForAllGuildsFromD1()
       .catch(
         (error) => {
           console.error(
