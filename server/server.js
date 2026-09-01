@@ -62,6 +62,14 @@ const KOTOBARU_LOG_ENCRYPTION_KEY =
   process.env.KOTOBARU_LOG_ENCRYPTION_KEY?.trim() ||
   "";
 
+/*
+ * Cloudflare Cron Workerから日次集計を起動するための共有秘密。
+ * GitHubへ直書きせずRender Environmentへ設定します。
+ */
+const KOTOBARU_CRON_SECRET =
+  process.env.KOTOBARU_CRON_SECRET?.trim() ||
+  "";
+
 /* =========================================================
  * Discord REST API
  *
@@ -4333,7 +4341,7 @@ async function ensureYesterdaySummaryForGuild(
   const recent =
     await fetchRecentKotobaruMessagesRest(
       config.logChannelId,
-      100
+      1000
     );
 
   const alreadyDone =
@@ -4358,27 +4366,88 @@ async function ensureYesterdaySummaryForGuild(
       yesterday
     );
 
-  await discordRest(
-    `/channels/${config.logChannelId}/messages`,
-    {
-      method:
-        "POST",
+  /*
+   * 投稿できた場合だけ完了マーカーを残します。
+   * Render起床直後などで一時的に記録を読めなかった場合、
+   * 次回のawake / Cronで再試行できるようにします。
+   */
+  if (posted) {
+    await discordRest(
+      `/channels/${config.logChannelId}/messages`,
+      {
+        method:
+          "POST",
 
-      body:
-        JSON.stringify({
-          content:
-            marker,
-          flags:
-            SUPPRESS_NOTIFICATIONS_FLAG,
-        }),
-    }
-  );
+        body:
+          JSON.stringify({
+            content:
+              marker,
+            flags:
+              SUPPRESS_NOTIFICATIONS_FLAG,
+          }),
+      }
+    );
+  }
 
   return {
     configured: true,
     posted,
     alreadyDone: false,
   };
+}
+
+/* =========================================================
+ * 全サーバーの日次集計
+ *
+ * ensureYesterdaySummaryForGuildを使うため、同じ日の重複投稿を防げます。
+ * ======================================================= */
+
+async function runYesterdaySummariesForAllGuilds() {
+  const ready =
+    await waitForKotobaruBotReady(
+      60000
+    );
+
+  if (!ready) {
+    throw new Error(
+      "ことばルBotが60秒以内にDiscord Gatewayへ接続できませんでした"
+    );
+  }
+
+  const results = [];
+
+  for (
+    const guild of
+    kotobaruBot.guilds.cache.values()
+  ) {
+    try {
+      const result =
+        await ensureYesterdaySummaryForGuild(
+          guild.id
+        );
+
+      results.push({
+        guildId: guild.id,
+        guildName: guild.name,
+        ...result,
+      });
+    } catch (error) {
+      console.error(
+        `ことばル日次集計エラー (${guild.id}):`,
+        error
+      );
+
+      results.push({
+        guildId: guild.id,
+        guildName: guild.name,
+        error:
+          error?.message ||
+          String(error),
+      });
+    }
+  }
+
+  return results;
 }
 
 /* =========================================================
@@ -5116,6 +5185,8 @@ app.post(
       return res.json({
         access_token:
           data.access_token,
+        expires_in:
+          Number(data.expires_in) || 3600,
       });
     } catch (error) {
       console.error(
@@ -5661,6 +5732,88 @@ app.post(
 );
 
 /* =========================================================
+ * Cloudflare Cron Worker用 日次集計エンドポイント
+ *
+ * Render Freeが寝ている時間でも、Cloudflare CronがこのURLを叩くことで
+ * Renderを起床させ、昨日の結果を自動公開します。
+ * ======================================================= */
+
+app.post(
+  "/api/kotobaru/daily-summary",
+  async (req, res) => {
+    if (!KOTOBARU_CRON_SECRET) {
+      return res
+        .status(503)
+        .json({
+          error:
+            "KOTOBARU_CRON_SECRET is not configured",
+        });
+    }
+
+    const authorization =
+      req.headers.authorization ||
+      "";
+
+    const expected =
+      `Bearer ${KOTOBARU_CRON_SECRET}`;
+
+    /*
+     * timingSafeEqualで共有秘密を比較します。
+     */
+    const authorized =
+      authorization.length ===
+        expected.length &&
+      crypto.timingSafeEqual(
+        Buffer.from(authorization),
+        Buffer.from(expected)
+      );
+
+    if (!authorized) {
+      return res
+        .status(401)
+        .json({
+          error: "unauthorized",
+        });
+    }
+
+    try {
+      console.log(
+        "ことばル Cloudflare Cronから日次集計を開始します。"
+      );
+
+      const results =
+        await runYesterdaySummariesForAllGuilds();
+
+      console.log(
+        "ことばル Cloudflare Cron日次集計完了:",
+        JSON.stringify(results)
+      );
+
+      return res.json({
+        ok: true,
+        date:
+          previousJstDateKey(),
+        results,
+      });
+    } catch (error) {
+      console.error(
+        "ことばル Cloudflare Cron日次集計失敗:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            String(error),
+        });
+    }
+  }
+);
+
+/* =========================================================
  * ヘルスチェック
  * ======================================================= */
 
@@ -5694,6 +5847,11 @@ app.get(
       encryptionConfigured:
         Boolean(
           getKotobaruEncryptionKey()
+        ),
+
+      cronConfigured:
+        Boolean(
+          KOTOBARU_CRON_SECRET
         ),
     });
   }
@@ -6196,7 +6354,7 @@ app.post(
 cron.schedule(
   "5 0 * * *",
   () => {
-    postYesterdayKotobaruSummary()
+    runYesterdaySummariesForAllGuilds()
       .catch(
         (error) => {
           console.error(
