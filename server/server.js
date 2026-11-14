@@ -252,6 +252,7 @@ async function discordRestMultipart(
           headers: {
             "content-type":
               "application/json",
+            "x-kotobaru-discord-source": "render_worker_transport",
           },
         }
       );
@@ -289,6 +290,7 @@ async function kotobaruDataInternal(
       `${KOTOBARU_DATA_URL}${pathname}`,
       {
         ...options,
+        signal: options.signal ?? AbortSignal.timeout(12_000),
         headers: {
           "Content-Type":
             "application/json",
@@ -1025,25 +1027,12 @@ const oauthUserCache =
  * 日本時間
  * ======================================================= */
 
-function jstDateKey(
-  date = new Date()
-) {
-  return new Intl.DateTimeFormat(
-    "en-CA",
-    {
-      timeZone:
-        "Asia/Tokyo",
-
-      year:
-        "numeric",
-
-      month:
-        "2-digit",
-
-      day:
-        "2-digit",
-    }
-  ).format(date);
+const kotobaruJstFormatter = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit",
+});
+function jstDateKey(date = new Date()) {
+  const parts = Object.fromEntries(kotobaruJstFormatter.formatToParts(date).map(({ type, value }) => [type, value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
 function previousJstDateKey() {
@@ -3120,160 +3109,36 @@ function discordUserAvatarUrl(
   )}.png`;
 }
 
-function discordGuildMemberAvatarUrl(
-  guildId,
-  userId,
-  avatarHash
-) {
-  return `https://cdn.discordapp.com/guilds/${guildId}/users/${userId}/avatars/${avatarHash}.png?size=128`;
-}
-
-async function getDiscordGuildMemberProfile(
-  guildId,
-  userId
-) {
+async function fetchImageAsDataUri(url) {
   try {
-    const response =
-      await discordRest(
-        `/guilds/${guildId}/members/${userId}`
-      );
-
-    if (!response.ok) {
-      return null;
-    }
-
-    return await response.json();
-  } catch (error) {
-    console.warn(
-      "Discordメンバー情報取得失敗:",
-      error
-    );
-
+    const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
+    if (!response.ok) return null;
+    const contentType = response.headers.get("content-type")?.split(";")[0];
+    if (!/^image\/(png|jpeg|webp|gif)$/i.test(contentType || "")) return null;
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (!bytes.length || bytes.length > 256 * 1024) return null;
+    return `data:${contentType};base64,${bytes.toString("base64")}`;
+  } catch {
     return null;
   }
 }
 
-async function fetchImageAsDataUri(
-  url
-) {
-  try {
-    const response =
-      await fetch(url);
-
-    if (!response.ok) {
-      return null;
-    }
-
-    const bytes =
-      Buffer.from(
-        await response.arrayBuffer()
-      );
-
-    const contentType =
-      response.headers.get(
-        "content-type"
-      ) || "image/png";
-
-    return `data:${contentType};base64,${bytes.toString(
-      "base64"
-    )}`;
-  } catch (error) {
-    console.warn(
-      "Discordアイコン画像取得失敗:",
-      error
-    );
-
-    return null;
-  }
-}
-
-async function getDiscordPreviewProfile(
-  guildId,
-  entry
-) {
-  const cacheKey =
-    `${guildId}:${entry.userId}:${entry.avatarHash || "default"}`;
-
-  const cached =
-    avatarDataCache.get(
-      cacheKey
-    );
-
-  if (cached) {
-    return cached;
-  }
-
-  const member =
-    await getDiscordGuildMemberProfile(
-      guildId,
-      entry.userId
-    );
-
-  const memberAvatarHash =
-    member?.avatar ||
-    null;
-
-  const globalAvatarHash =
-    member?.user?.avatar ||
-    entry.avatarHash ||
-    null;
-
-  const discriminator =
-    member?.user?.discriminator ||
-    "0";
-
-  const avatarUrl =
-    memberAvatarHash
-      ? discordGuildMemberAvatarUrl(
-          guildId,
-          entry.userId,
-          memberAvatarHash
-        )
-      : discordUserAvatarUrl(
-          entry.userId,
-          globalAvatarHash,
-          discriminator
-        );
-
-  let avatarDataUri =
-    await fetchImageAsDataUri(
-      avatarUrl
-    );
-
-  /*
-   * サーバー専用アイコンの取得だけ失敗した場合は
-   * グローバルアイコンでもう一度試します。
-   */
-  if (
-    !avatarDataUri &&
-    memberAvatarHash
-  ) {
-    avatarDataUri =
-      await fetchImageAsDataUri(
-        discordUserAvatarUrl(
-          entry.userId,
-          globalAvatarHash,
-          discriminator
-        )
-      );
-  }
-
+async function getDiscordPreviewProfile(guildId, entry) {
+  const cacheKey = `${guildId}:${entry.userId}:${entry.avatarHash || "default"}`;
+  const cached = avatarDataCache.get(cacheKey);
+  if (cached?.expiresAt > Date.now()) return { ...cached, displayName: entry.displayName || cached.displayName };
+  // D1 already has the authenticated player's display name and avatar. Do not block
+  // a preview on Discord REST member lookups. The SVG uses initials if CDN fails.
+  const avatarHash = /^(?:a_)?[0-9a-f]{32}$/i.test(entry.avatarHash || "") ? entry.avatarHash : null;
+  const avatarDataUri = /^\d{15,25}$/.test(entry.userId || "")
+    ? await fetchImageAsDataUri(discordUserAvatarUrl(entry.userId, avatarHash)) : null;
   const profile = {
-    avatarDataUri,
-
-    displayName:
-      member?.nick ||
-      member?.user?.global_name ||
-      entry.displayName ||
-      member?.user?.username ||
-      "挑戦者",
+    avatarDataUri, displayName: entry.displayName || "挑戦者",
+    expiresAt: Date.now() + (avatarDataUri ? 30 * 60_000 : 60_000),
   };
-
-  avatarDataCache.set(
-    cacheKey,
-    profile
-  );
-
+  avatarDataCache.delete(cacheKey);
+  avatarDataCache.set(cacheKey, profile);
+  if (avatarDataCache.size > 500) avatarDataCache.delete(avatarDataCache.keys().next().value);
   return profile;
 }
 
@@ -3985,11 +3850,11 @@ async function renderKotobaruPreviewPng(
       guildId
     );
 
-  const svg =
-    buildKotobaruPreviewSvg(
-      enriched,
-      puzzleNumber
-    );
+  return renderKotobaruPreviewSvgPng(enriched, puzzleNumber);
+}
+
+function renderKotobaruPreviewSvgPng(entries, puzzleNumber) {
+  const svg = buildKotobaruPreviewSvg(entries, puzzleNumber);
 
   const resvg =
     new Resvg(svg, {
@@ -4158,6 +4023,19 @@ function latestPreviewDiagnostic(guildId = null) {
   return all.find((entry) => !guildId || entry.guildId === guildId) || null;
 }
 
+function previewResponseDetail(response) {
+  const source = response.headers.get("x-kotobaru-discord-source");
+  return ["discord_http", "discord_network", "discord_timeout", "worker_cooldown",
+    "render_worker_transport"].includes(source) ? source : "unclassified_response";
+}
+
+function previewRetryDelay(response) {
+  const value = response.headers.get("retry-after");
+  if (!value) return 0;
+  const seconds = Number(value);
+  return Number.isFinite(seconds) ? Math.max(0, seconds * 1000) : Math.max(0, Date.parse(value) - Date.now()) || 0;
+}
+
 function previewFailure(guildId, date, sessionId, stage, status, detail = "", retryAfter = 0) {
   const error = String(detail || "").slice(0, 350);
   setPreviewDiagnostic(guildId, date, sessionId, {
@@ -4174,16 +4052,18 @@ function scheduleKotobaruPreviewRetry({ guildId, date, sessionId, retryAfter = 0
   const key = previewDiagnosticKey(guildId, date, sessionId);
   const current = kotobaruPreviewRetryTimers.get(key);
   if (current) return;
-  const delay = Math.min(60 * 60_000, Math.max(90_000, Number(retryAfter) || 0));
+  const delay = Math.max(90_000, Number(retryAfter) || 0);
+  if (date !== jstDateKey() || delay > 2_147_000_000) return;
   const timer = setTimeout(async () => {
     kotobaruPreviewRetryTimers.delete(key);
+    if (date !== jstDateKey()) return;
     try {
       const data = await loadKotobaruD1Session(guildId, date, sessionId);
       const entry = Array.isArray(data.entries) ? data.entries[0] : null;
       if (!entry) return;
       await upsertKotobaruLiveCardFromD1(guildId, date, Number(entry.puzzleNumber), sessionId);
     } catch (error) {
-      console.warn("ことばルPreview再試行通信失敗:", String(error?.message || error));
+      previewFailure(guildId, date, sessionId, "d1_session_read", 503, error?.name || "Error");
     }
   }, delay);
   timer.unref?.();
@@ -4220,12 +4100,13 @@ async function upsertKotobaruLiveCardFromD1Once(
   puzzleNumber,
   sessionId
 ) {
-  const data =
-    await loadKotobaruD1Session(
-      guildId,
-      date,
-      sessionId
-    );
+  if (date !== jstDateKey()) return false;
+  let data;
+  try {
+    data = await loadKotobaruD1Session(guildId, date, sessionId);
+  } catch (error) {
+    return previewFailure(guildId, date, sessionId, "d1_session_read", 503, error?.name || "Error");
+  }
 
   const entries =
     Array.isArray(data.entries)
@@ -4255,12 +4136,18 @@ async function upsertKotobaruLiveCardFromD1Once(
       true
     );
 
-  const previewPng =
-    await renderKotobaruPreviewPng(
-      entries,
-      puzzleNumber,
-      guildId
-    );
+  let previewPng;
+  try {
+    previewPng = await renderKotobaruPreviewPng(entries, puzzleNumber, guildId);
+  } catch (error) {
+    console.warn("ことばルPreview画像生成失敗:", error?.name || "Error");
+    // A broken/missing avatar must not prevent a PNG from being built.
+    try {
+      previewPng = renderKotobaruPreviewSvgPng(entries.map((entry) => ({ ...entry, avatarDataUri: null })), puzzleNumber);
+    } catch (fallbackError) {
+      return previewFailure(guildId, date, sessionId, "image_render", 500, fallbackError?.name || "Error");
+    }
+  }
 
   const files = [
     {
@@ -4299,8 +4186,7 @@ async function upsertKotobaruLiveCardFromD1Once(
     // 403や429でPOSTに切り替えるとエラーと重複投稿が増えます。
     if (editResponse.status !== 404) {
       return previewFailure(guildId, date, sessionId, "discord_edit", editResponse.status,
-        await editResponse.text().catch(() => ""),
-        Number(editResponse.headers.get("retry-after") || 0) * 1000);
+        previewResponseDetail(editResponse), previewRetryDelay(editResponse));
     }
     console.warn("ことばルPreviewの元メッセージが404のため再作成します:", currentMessageId);
   }
@@ -4317,8 +4203,7 @@ async function upsertKotobaruLiveCardFromD1Once(
 
   if (!createResponse.ok) {
     return previewFailure(guildId, date, sessionId, "discord_create", createResponse.status,
-      await createResponse.text().catch(() => ""),
-      Number(createResponse.headers.get("retry-after") || 0) * 1000);
+      previewResponseDetail(createResponse), previewRetryDelay(createResponse));
   }
 
   const created = await createResponse.json();
@@ -5388,6 +5273,11 @@ const kotobaruCommands = [
     ),
 
   new SlashCommandBuilder()
+    .setName("ことばルプレビュー確認")
+    .setDescription("今日のD1保存済み結果からプレビューを再同期します")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
+
+  new SlashCommandBuilder()
     .setName(
       "ことばルd1移行"
     )
@@ -5541,6 +5431,19 @@ kotobaruBot.on(
               ].join("\n")
         );
 
+        return;
+      }
+
+      if (interaction.commandName === "ことばルプレビュー確認") {
+        if (!interaction.guildId || !interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels)) return;
+        await interaction.deferReply({ ephemeral: true });
+        const guildId = interaction.guildId;
+        const date = jstDateKey();
+        const updated = await refreshLatestKotobaruPreviewFromD1(guildId, date);
+        const diagnostic = latestPreviewDiagnostic(guildId);
+        await interaction.editReply(updated
+          ? "今日の保存済み盤面からプレビューを表示先に同期しました。"
+          : `プレビュー未更新（${diagnostic?.stage || "unknown"} / HTTP ${diagnostic?.status ?? "—"} / ${diagnostic?.error || "—"}）`);
         return;
       }
 
@@ -6287,20 +6190,27 @@ app.post(
         });
     }
 
-    // D1側で「このユーザーがこのsessionの回答者か」を検証します。
-    // 認証なしの外部リクエストにDiscord投稿を誘発させないためです。
+    if (date !== jstDateKey()) return res.status(409).json({ error: "preview date is not today" });
     const sessionToken = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
-    if (!sessionToken) return res.status(401).json({ error: "Kotobaru session required" });
+    if (!sessionToken) {
+      previewFailure(guildId, date, sessionId, "missing_session", 401, "session token missing");
+      return res.status(401).json({ error: "Kotobaru session required" });
+    }
+    console.log("ことばルPreview同期受付:", guildId, date);
+    let authorizedPreview = false;
     try {
       const verified = await kotobaruDataInternal("/internal/verify-preview-sync", {
         method: "POST",
         body: JSON.stringify({ sessionToken, guildId, date, puzzleNumber, sessionId }),
       });
       if (!verified.ok) {
-        return res.status(verified.status === 403 ? 403 : 503).json({
-          error: "preview session verification failed", status: verified.status,
-        });
+        const status = verified.status === 403 ? 403 : 503;
+        // Never schedule a write when player authorization has not succeeded.
+        setPreviewDiagnostic(guildId, date, sessionId, { ok: false, stage: "verify_session", status,
+          error: `Worker HTTP ${verified.status}` });
+        return res.status(status).json({ error: "preview session verification failed", status: verified.status });
       }
+      authorizedPreview = true;
       const updated =
         await upsertKotobaruLiveCardFromD1(
           guildId,
@@ -6315,11 +6225,12 @@ app.post(
         preview: latestPreviewDiagnostic(guildId),
       });
     } catch (error) {
-      console.warn("ことばルD1 Preview同期失敗:", error);
+      const stage = authorizedPreview ? "unexpected_error" : "verify_session_transport";
+      console.warn("ことばルD1 Preview同期失敗:", stage, error?.name || "Error");
       setPreviewDiagnostic(guildId, date, sessionId, {
-        ok: false, stage: "unexpected_error", status: 500,
-        error: String(error?.message || error).slice(0, 350),
+        ok: false, stage, status: 503, error: error?.name || "Error",
       });
+      if (!authorizedPreview) return res.status(503).json({ error: stage });
       scheduleKotobaruPreviewRetry({ guildId, date, sessionId });
       return res.json({ ok: true, updated: false, preview: latestPreviewDiagnostic(guildId) });
     }
@@ -6367,7 +6278,7 @@ app.get(
           getKotobaruEncryptionKey()
         ),
 
-      maintenanceVersion: "15.5",
+      maintenanceVersion: "15.6",
       summaryExecution: "cloudflare-worker",
 
       d1Configured:
@@ -6455,7 +6366,7 @@ app.get(
           KOTOBARU_DATA_URL &&
           KOTOBARU_DATA_INTERNAL_SECRET
         ),
-      maintenanceVersion: "15.5",
+      maintenanceVersion: "15.6",
       summaryExecution: "cloudflare-worker",
       d1ConfigReady,
       latestPreview: (() => {
@@ -6470,53 +6381,24 @@ app.get(
   }
 );
 
-async function refreshLatestKotobaruPreviewFromD1(
-  guildId,
-  date = jstDateKey()
-) {
+async function refreshLatestKotobaruPreviewFromD1(guildId, date = jstDateKey()) {
   try {
-    const data =
-      await loadKotobaruD1Day(
-        guildId,
-        date
-      );
-
-    const entries =
-      Array.isArray(data.entries)
-        ? data.entries
-        : [];
-
-    if (!entries.length) {
+    const query = new URLSearchParams({ guildId, date });
+    const response = await kotobaruDataInternal(`/internal/latest-preview?${query}`);
+    if (!response.ok) {
+      setPreviewDiagnostic(guildId, date, "awake", { ok: false, stage: "d1_latest_read", status: response.status });
       return false;
     }
-
-    const latest =
-      [...entries].sort(
-        (a, b) =>
-          Number(b.updatedAt || 0) -
-          Number(a.updatedAt || 0)
-      )[0];
-
-    if (
-      !latest?.sessionId ||
-      !Number.isInteger(
-        Number(latest.puzzleNumber)
-      )
-    ) {
+    const { latest } = await response.json();
+    if (!latest?.sessionId || !Number.isInteger(latest.puzzleNumber)) {
+      setPreviewDiagnostic(guildId, date, "awake", { ok: false, stage: "no_plays_today", status: null });
       return false;
     }
-
-    return await upsertKotobaruLiveCardFromD1(
-      guildId,
-      date,
-      Number(latest.puzzleNumber),
-      latest.sessionId
-    );
+    return await upsertKotobaruLiveCardFromD1(guildId, date, latest.puzzleNumber, latest.sessionId);
   } catch (error) {
-    console.warn(
-      "ことばル起動時Preview再同期失敗:",
-      error?.message || error
-    );
+    const stage = "preview_refresh_transport";
+    setPreviewDiagnostic(guildId, date, "awake", { ok: false, stage, status: 503, error: error?.name || "Error" });
+    console.warn("ことばル起動時Preview再同期失敗:", stage, error?.name || "Error");
     return false;
   }
 }
@@ -6528,12 +6410,21 @@ app.post("/api/kotobaru/awake", async (req, res) => {
   if (typeof guildId !== "string" || !/^\d{15,25}$/.test(guildId)) {
     return res.status(400).json({ error: "invalid guildId" });
   }
-  if (!sessionToken) return res.status(401).json({ error: "Kotobaru session required" });
+  if (!sessionToken) {
+    setPreviewDiagnostic(guildId, jstDateKey(), "awake", { ok: false, stage: "awake_missing_session", status: 401,
+      error: "Activityのdiscord.tsの反映を確認してください" });
+    return res.status(401).json({ error: "Kotobaru session required" });
+  }
   try {
     const verified = await kotobaruDataInternal("/internal/verify-awake", {
       method: "POST", body: JSON.stringify({ sessionToken, guildId }), signal: AbortSignal.timeout(8_000),
     });
-    if (!verified.ok) return res.status(verified.status === 403 ? 403 : 503).json({ error: "awake verification failed" });
+    if (!verified.ok) {
+      const status = verified.status === 403 ? 403 : 503;
+      setPreviewDiagnostic(guildId, jstDateKey(), "awake", { ok: false, stage: "awake_verify_session", status,
+        error: `Worker HTTP ${verified.status}` });
+      return res.status(status).json({ error: "awake verification failed" });
+    }
     res.json({ ok: true, gatewayReady: kotobaruBot.isReady() });
     void refreshLatestKotobaruPreviewFromD1(guildId, jstDateKey());
   } catch (error) {
