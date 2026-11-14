@@ -7,7 +7,6 @@ import fs from "fs";
 import crypto from "node:crypto";
 import { fileURLToPath } from "url";
 import { Server } from "socket.io";
-import cron from "node-cron";
 import { Resvg } from "@resvg/resvg-js";
 
 import {
@@ -60,14 +59,6 @@ const KOTOBARU_BOT_TOKEN =
 
 const KOTOBARU_LOG_ENCRYPTION_KEY =
   process.env.KOTOBARU_LOG_ENCRYPTION_KEY?.trim() ||
-  "";
-
-/*
- * Cloudflare Cron Workerから日次集計を起動するための共有秘密。
- * GitHubへ直書きせずRender Environmentへ設定します。
- */
-const KOTOBARU_CRON_SECRET =
-  process.env.KOTOBARU_CRON_SECRET?.trim() ||
   "";
 
 /*
@@ -1022,15 +1013,6 @@ const avatarDataCache =
  */
 const guildConfigs =
   new Map();
-
-/*
- * 起動カード掃除の多重実行を防ぐための管理。
- * 同じチャンネルで複数人がほぼ同時にActivityを起動しても、
- * 1セットの走査だけを実行します。
- */
-const launchCleanupScheduledUntil =
-  new Map();
-const launchCleanupBackoffUntil = new Map();
 
 /*
  * 盤面復元APIでBearer Tokenを毎回Discordへ照会しすぎないための
@@ -4351,332 +4333,14 @@ async function upsertKotobaruLiveCardFromD1Once(
   return true;
 }
 
-async function getKotobaruD1SummaryStatus(
-  guildId,
-  date
-) {
-  const query =
-    new URLSearchParams({
-      guildId,
-      date,
-    });
-
-  const response =
-    await kotobaruDataInternal(
-      `/internal/summary-status?${query.toString()}`
-    );
-
-  if (!response.ok) {
-    return false;
-  }
-
-  const data =
-    await response.json();
-
-  return Boolean(
-    data.posted
-  );
-}
-
-async function markKotobaruD1SummaryPosted(
-  guildId,
-  date
-) {
-  const response =
-    await kotobaruDataInternal(
-      "/internal/summary-posted",
-      {
-        method: "POST",
-        body:
-          JSON.stringify({
-            guildId,
-            date,
-          }),
-      }
-    );
-
-  return response.ok;
-}
-
-/* =========================================================
- * 日次結果の重複投稿防止
- * D1に完了マークを記録する前にRenderが停止した場合でも、
- * Discordに既に投稿済みなら再利用します。
- * ======================================================= */
-async function findExistingKotobaruSummaryInChannel(channelId, date) {
-  const response = await discordRest(`/channels/${channelId}/messages?limit=100`);
-  if (!response.ok) {
-    throw new Error(`日次結果の重複確認に失敗: HTTP ${response.status} ${
-      (await response.text().catch(() => "")).slice(0, 180)
-    }`);
-  }
-  const messages = await response.json();
-  if (!Array.isArray(messages)) throw new Error("日次結果の重複確認でメッセージ配列を取得できませんでした");
-  const found = messages.find((message) =>
-    message?.author?.id === KOTOBARU_CLIENT_ID &&
-    typeof message.content === "string" &&
-    message.content.includes("ことばル 第") &&
-    message.content.includes("結果") &&
-    Array.isArray(message.embeds) &&
-    message.embeds.some((embed) => embed?.footer?.text === date)
-  );
-  return found?.id || null;
-}
-
-const kotobaruSummaryInFlight = new Map();
-
-async function postKotobaruSummaryForGuildFromD1(
-  guildId,
-  date = previousJstDateKey()
-) {
-  const data =
-    await loadKotobaruD1Day(
-      guildId,
-      date
-    );
-
-  const records =
-    Array.isArray(data.entries)
-      ? data.entries
-      : [];
-
-  if (!records.length) {
-    return false;
-  }
-
-  const config =
-    data.settings ||
-    await getKotobaruGuildConfig(
-      guildId
-    );
-
-  if (!config?.summaryChannelId) {
-    console.warn(`ことばル日次結果公開先未設定: guild=${guildId} / date=${date}`);
-    return false;
-  }
-
-  // 投稿に失敗したと見なした日でも、Discord側だけ成功している場合があります。
-  // 先に既存メッセージを探し、見つかったらD1の投稿済みマークだけ修復します。
-  const existingSummaryId = await findExistingKotobaruSummaryInChannel(config.summaryChannelId, date);
-  if (existingSummaryId) {
-    const marked = await markKotobaruD1SummaryPosted(guildId, date);
-    if (!marked) throw new Error(`日次結果の既存投稿${existingSummaryId}を検出しましたがD1マークを保存できません`);
-    console.log(`ことばル日次結果を再確認してD1を修復: guild=${guildId} / date=${date} / message=${existingSummaryId}`);
-    return true;
-  }
-
-  const puzzleNumber =
-    Math.max(
-      ...records.map(
-        (record) =>
-          Number(
-            record.puzzleNumber
-          ) || 1
-      )
-    );
-
-  const sorted =
-    [...records].sort(
-      (a, b) => {
-        if (a.won !== b.won) {
-          return a.won
-            ? -1
-            : 1;
-        }
-
-        if (
-          a.won &&
-          b.won &&
-          a.attempts !==
-            b.attempts
-        ) {
-          return (
-            a.attempts -
-            b.attempts
-          );
-        }
-
-        if (
-          Boolean(a.finished) !==
-          Boolean(b.finished)
-        ) {
-          return a.finished
-            ? -1
-            : 1;
-        }
-
-        return (
-          Number(a.savedAt || a.updatedAt || 0) -
-          Number(b.savedAt || b.updatedAt || 0)
-        );
-      }
-    );
-
-  const entries =
-    sorted.map(
-      (record) => ({
-        ...record,
-        historical: true,
-      })
-    );
-
-  const previewPng =
-    await renderKotobaruPreviewPng(
-      entries,
-      puzzleNumber,
-      guildId
-    );
-
-  const wordsPng =
-    await renderKotobaruWordsPng(
-      entries,
-      puzzleNumber,
-      guildId
-    );
-
-  const payload = {
-    content:
-      `**ことばル 第${puzzleNumber}問　${date}の結果**`,
-    embeds: [
-      {
-        title:
-          "昨日の順位",
-        description:
-          `${sorted.length}人が挑戦しました。`,
-        color:
-          0x4aa340,
-        image: {
-          url:
-            "attachment://preview.png",
-        },
-        footer: {
-          text: date,
-        },
-      },
-      {
-        title:
-          "みんなが使ったことば",
-        color:
-          0x4aa340,
-        image: {
-          url:
-            "attachment://words.png",
-        },
-      },
-    ],
-    attachments: [
-      {
-        id: 0,
-        filename:
-          "preview.png",
-        description:
-          "ことばルの昨日の順位",
-      },
-      {
-        id: 1,
-        filename:
-          "words.png",
-        description:
-          "ことばルで昨日使われたことば",
-      },
-    ],
-    components:
-      activityLinkButton(
-        "Play now!"
-      ),
-    flags:
-      SUPPRESS_NOTIFICATIONS_FLAG,
-  };
-
-  const summaryNonce = `kbs-${crypto.createHash("sha256")
-    .update(`${guildId}:${date}:summary`).digest("hex").slice(0, 20)}`;
-  const response =
-    await discordRestMultipart(
-      `/channels/${config.summaryChannelId}/messages`,
-      "POST",
-      { ...payload, nonce: summaryNonce, enforce_nonce: true },
-      [
-        {
-          name:
-            "preview.png",
-          data:
-            previewPng,
-          contentType:
-            "image/png",
-        },
-        {
-          name:
-            "words.png",
-          data:
-            wordsPng,
-          contentType:
-            "image/png",
-        },
-      ]
-    );
-
-  if (!response.ok) {
-    console.warn(
-      "D1昨日結果投稿失敗:",
-      response.status,
-      await response.text().catch(() => "")
-    );
-    return false;
-  }
-
-  const marked = await markKotobaruD1SummaryPosted(guildId, date);
-  if (!marked) throw new Error(`Discordには結果を投稿しましたがD1の投稿済みフラグ保存に失敗: ${guildId}/${date}`);
-
-  return true;
-}
-
-async function ensureYesterdaySummaryForGuildFromD1(
-  guildId,
-  date = previousJstDateKey()
-) {
-  const key = `${guildId}:${date}`;
-  if (kotobaruSummaryInFlight.has(key)) return kotobaruSummaryInFlight.get(key);
-  const job = (async () => {
-    if (await getKotobaruD1SummaryStatus(guildId, date)) {
-      return { date, posted: false, alreadyDone: true };
-    }
-    const posted = await postKotobaruSummaryForGuildFromD1(guildId, date);
-    return { date, posted, alreadyDone: false };
-  })();
-  kotobaruSummaryInFlight.set(key, job);
-  try { return await job; } finally { kotobaruSummaryInFlight.delete(key); }
-}
-
-/*
- * Cronは「昨日だけ」ではなく、直近7日分の未投稿結果をD1から取得します。
- * 1回につき最大6件まで。429等で失敗してもD1の未投稿状態は残り、
- * 次のCronまたはActivity起動時に再試行できます。
- */
-async function runYesterdaySummariesForAllGuildsFromD1(guildId = null) {
-  const query = new URLSearchParams({ days: "7", limit: "6" });
-  if (guildId) query.set("guildId", guildId);
-  const response = await kotobaruDataInternal(`/internal/pending-summaries?${query.toString()}`);
-  if (!response.ok) {
-    throw new Error(`D1未投稿リスト取得失敗: HTTP ${response.status} ${
-      (await response.text().catch(() => "")).slice(0, 180)
-    }`);
-  }
+async function runKotobaruWorkerSummaries(guildId) {
+  const response = await kotobaruDataInternal("/internal/run-summaries", {
+    method: "POST", body: JSON.stringify({ guildId }), signal: AbortSignal.timeout(120_000),
+  });
+  if (!response.ok) throw new Error(`Worker集計 HTTP ${response.status}`);
   const data = await response.json();
-  const results = [];
-  for (const item of data.jobs || []) {
-    try {
-      const outcome = await ensureYesterdaySummaryForGuildFromD1(item.guildId, item.date);
-      results.push({ guildId: item.guildId, date: item.date, ...outcome });
-    } catch (error) {
-      const detail = String(error?.message || error);
-      console.error(`ことばル日次結果公開失敗 guild=${item.guildId} date=${item.date}: ${detail}`);
-      results.push({ guildId: item.guildId, date: item.date, posted: false, error: detail });
-    }
-    // 大量の過去分を一気に投稿して429を誘発しないよう間隔を設けます。
-    if (data.jobs.length > 1) await wait(1_200);
-  }
-  console.log(`ことばル日次未投稿確認: 対象${(data.jobs || []).length}件 / 処理${results.length}件`);
-  return results;
+  if (!data.ok || !Array.isArray(data.results)) throw new Error("Workerの集計結果が不正です");
+  return data.results;
 }
 
 async function migrateLegacyKotobaruDayToD1(
@@ -5636,10 +5300,8 @@ async function showKotobaruSetup(
       true,
   });
 
-  const config =
-    await refreshKotobaruGuildConfig(
-      interaction.guild
-    );
+  const config = await getKotobaruConfigFromD1(interaction.guild.id)
+    || await getKotobaruGuildConfig(interaction.guild.id);
 
   if (!config) {
     await interaction.editReply(
@@ -5817,75 +5479,6 @@ kotobaruBot.on(
  * スラッシュコマンド実行
  * ======================================================= */
 
-/* =========================================================
- * Renderが起きている間は、起動カードをリアルタイムで削除
- * ======================================================= */
-
-kotobaruBot.on(
-  Events.MessageCreate,
-  async (message) => {
-    try {
-      if (
-        !isKotobaruLaunchCardMessage(
-          message
-        )
-      ) {
-        return;
-      }
-
-      console.log(
-        "ことばル起動カードをGatewayで検知:",
-        JSON.stringify(
-          summarizeKotobaruMessageForLog(
-            message
-          )
-        )
-      );
-
-      const channelId =
-        message.channelId ??
-        message.channel_id;
-
-      if (!channelId) {
-        return;
-      }
-
-      const response =
-        await discordRest(
-          `/channels/${channelId}/messages/${message.id}`,
-          {
-            method: "DELETE",
-          }
-        );
-
-      if (
-        response.ok ||
-        response.status === 404
-      ) {
-        console.log(
-          `ことばル起動カード即時削除: ${message.id}`
-        );
-      } else {
-        console.warn(
-          "ことばル起動カード即時削除失敗:",
-          message.id,
-          response.status,
-          await response
-            .text()
-            .catch(
-              () => ""
-            )
-        );
-      }
-    } catch (error) {
-      console.warn(
-        "ことばル起動カードGateway整理エラー:",
-        error
-      );
-    }
-  }
-);
-
 kotobaruBot.on(
   Events.InteractionCreate,
   async (interaction) => {
@@ -5895,6 +5488,7 @@ kotobaruBot.on(
       return;
     }
 
+    console.log(`ことばルコマンド受信: ${interaction.commandName} / delayMs=${Math.max(0, Date.now() - interaction.createdTimestamp)}`);
     try {
       if (
         interaction.commandName ===
@@ -5935,12 +5529,12 @@ kotobaruBot.on(
 
         // この操作では自サーバーの直近7日間の未投稿分だけ復旧する。
         // 既に公開済みの結果を再投稿しない。
-        const results = await runYesterdaySummariesForAllGuildsFromD1(interaction.guild.id);
+        const results = await runKotobaruWorkerSummaries(interaction.guild.id);
         const posted = results.filter((item) => item.posted).length;
         const failed = results.filter((item) => item.error || (!item.posted && !item.alreadyDone));
         await interaction.editReply(
           results.length === 0
-            ? "直近7日間に未投稿の結果はありません。"
+            ? "直近7日間に、いま処理できる未投稿結果はありません。再試行待ちの結果はWorkerが後で処理します。"
             : [
                 `未投稿結果を確認しました。公開成功 ${posted}件 / 未完了 ${failed.length}件`,
                 ...results.map((item) => `${item.date}: ${item.posted ? "投稿・復旧済み" : item.alreadyDone ? "投稿済み" : `失敗 ${String(item.error || "設定または記録を確認").slice(0, 90)}`}`),
@@ -5996,7 +5590,8 @@ kotobaruBot.on(
     } catch (error) {
       console.error(
         "ことばルコマンドエラー:",
-        error
+        { command: interaction.commandName, status: error?.status ?? null,
+          code: error?.code ?? null, name: error?.name || "Error" }
       );
 
       const text =
@@ -6731,87 +6326,10 @@ app.post(
   }
 );
 
-/* =========================================================
- * Cloudflare Cron Worker用 日次集計エンドポイント
- *
- * Render Freeが寝ている時間でも、Cloudflare CronがこのURLを叩くことで
- * Renderを起床させ、昨日の結果を自動公開します。
- * ======================================================= */
-
-app.post(
-  "/api/kotobaru/daily-summary",
-  async (req, res) => {
-    if (!KOTOBARU_CRON_SECRET) {
-      return res
-        .status(503)
-        .json({
-          error:
-            "KOTOBARU_CRON_SECRET is not configured",
-        });
-    }
-
-    const authorization =
-      req.headers.authorization ||
-      "";
-
-    const expected =
-      `Bearer ${KOTOBARU_CRON_SECRET}`;
-
-    /*
-     * timingSafeEqualで共有秘密を比較します。
-     */
-    const authorized =
-      authorization.length ===
-        expected.length &&
-      crypto.timingSafeEqual(
-        Buffer.from(authorization),
-        Buffer.from(expected)
-      );
-
-    if (!authorized) {
-      return res
-        .status(401)
-        .json({
-          error: "unauthorized",
-        });
-    }
-
-    try {
-      console.log(
-        "ことばル Cloudflare Cronから日次集計を開始します。"
-      );
-
-      const results =
-        await runYesterdaySummariesForAllGuildsFromD1();
-
-      console.log(
-        "ことばル Cloudflare Cron日次集計完了:",
-        JSON.stringify(results)
-      );
-
-      const failed = results.filter((item) => item.error || (!item.posted && !item.alreadyDone));
-      return res.status(failed.length ? 503 : 200).json({
-        ok: failed.length === 0,
-        date: previousJstDateKey(),
-        results,
-      });
-    } catch (error) {
-      console.error(
-        "ことばル Cloudflare Cron日次集計失敗:",
-        error
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            error?.message ||
-            String(error),
-        });
-    }
-  }
-);
+// 古いWorkerからのリクエストで二重投稿しない。
+app.post("/api/kotobaru/daily-summary", (_req, res) => {
+  res.status(410).json({ error: "daily summary now runs in kotobaru-data Worker" });
+});
 
 /* =========================================================
  * ヘルスチェック
@@ -6849,10 +6367,8 @@ app.get(
           getKotobaruEncryptionKey()
         ),
 
-      cronConfigured:
-        Boolean(
-          KOTOBARU_CRON_SECRET
-        ),
+      maintenanceVersion: "15.5",
+      summaryExecution: "cloudflare-worker",
 
       d1Configured:
         Boolean(
@@ -6939,7 +6455,8 @@ app.get(
           KOTOBARU_DATA_URL &&
           KOTOBARU_DATA_INTERNAL_SECRET
         ),
-      cronConfigured: Boolean(KOTOBARU_CRON_SECRET),
+      maintenanceVersion: "15.5",
+      summaryExecution: "cloudflare-worker",
       d1ConfigReady,
       latestPreview: (() => {
         const entry = latestPreviewDiagnostic(requestedGuildId);
@@ -6952,386 +6469,6 @@ app.get(
     });
   }
 );
-
-function getKotobaruMessageApplicationId(
-  message
-) {
-  return (
-    message?.application_id ??
-    message?.applicationId ??
-    message?.application?.id ??
-    message?.interaction?.application_id ??
-    message?.interaction?.applicationId ??
-    null
-  );
-}
-
-function getKotobaruMessageWebhookId(
-  message
-) {
-  return (
-    message?.webhook_id ??
-    message?.webhookId ??
-    null
-  );
-}
-
-function getKotobaruMessageType(
-  message
-) {
-  const value =
-    message?.type?.value ??
-    message?.type;
-
-  return Number.isFinite(
-    Number(value)
-  )
-    ? Number(value)
-    : null;
-}
-
-function isKotobaruOwnPreview(message) {
-  const content = String(message?.content || "");
-  if (content.startsWith("**ことばル 第") || content.startsWith("**ことばル　第")) return true;
-  if (content.startsWith("KOTOBARU_")) return true;
-  const files = Array.isArray(message?.attachments) ? message.attachments :
-    typeof message?.attachments?.values === "function" ? [...message.attachments.values()] : [];
-  return files.some((item) => ["preview.png", "words.png"].includes(item?.filename || item?.name));
-}
-
-function isKotobaruLaunchCardMessage(message) {
-  if (!KOTOBARU_CLIENT_ID || isKotobaruOwnPreview(message)) return false;
-  const applicationId = String(getKotobaruMessageApplicationId(message) || "");
-  const authorId = String(message?.author?.id || "");
-  const meta = message?.interaction_metadata || message?.interactionMetadata || message?.interaction;
-  const metaAppId = String(meta?.application_id || meta?.applicationId || "");
-  const ours = [applicationId, authorId, metaAppId].includes(String(KOTOBARU_CLIENT_ID));
-  if (!ours) return false;
-
-  const type = getKotobaruMessageType(message);
-  const command = String(meta?.command_name || meta?.commandName || meta?.name || "").toLowerCase();
-  const activity = Boolean(message?.activity);
-  const embeds = Array.isArray(message?.embeds) ? message.embeds : [];
-  const hasInviteEmbed = embeds.some((embed) =>
-    /ゲーム招待|game invite/i.test(`${embed?.title || ""} ${embed?.description || ""}`) &&
-    !String(message?.content || "").includes("昨日の結果"));
-  const components = Array.isArray(message?.components) ? message.components : [];
-  const hasLaunchButton = components.some((row) =>
-    (row?.components || []).some((part) => /^(プレイ|play|join|参加)$/i.test(String(part?.label || ""))));
-  const isLaunchCommand = /^(起動|launch|play)$/.test(command);
-  const isInteraction = Boolean(meta || getKotobaruMessageWebhookId(message));
-
-  // システム由来の起動メッセージだけ削除する。通常投稿は対象にしない。
-  return (type === 20 && isInteraction) || isLaunchCommand ||
-    activity || hasInviteEmbed ||
-    (hasLaunchButton && (!String(message?.content || "").trim() || isInteraction));
-}
-
-function summarizeKotobaruMessageForLog(
-  message
-) {
-  return {
-    id:
-      message?.id ?? null,
-    type:
-      getKotobaruMessageType(
-        message
-      ),
-    authorId:
-      message?.author?.id ?? null,
-    applicationId:
-      getKotobaruMessageApplicationId(
-        message
-      ),
-    webhookId:
-      getKotobaruMessageWebhookId(
-        message
-      ),
-    hasInteractionMetadata:
-      Boolean(
-        message?.interaction_metadata ||
-        message?.interactionMetadata ||
-        message?.interaction
-      ),
-    interactionCommand:
-      message?.interaction_metadata?.command_name ||
-      message?.interactionMetadata?.commandName ||
-      message?.interaction?.name || null,
-    hasActivity: Boolean(message?.activity),
-    embeds: Array.isArray(message?.embeds) ? message.embeds.length : 0,
-    components: Array.isArray(message?.components) ? message.components.length : 0,
-    isOwnPreview: isKotobaruOwnPreview(message),
-  };
-}
-
-async function cleanupOldKotobaruLaunchMessages(
-  channelId
-) {
-  if (
-    typeof channelId !==
-      "string" ||
-    !channelId
-  ) {
-    return {
-      scanned: 0,
-      matched: 0,
-      deleted: 0,
-      forbidden: false,
-    };
-  }
-
-  const result = {
-    scanned: 0,
-    matched: 0,
-    deleted: 0,
-    forbidden: false,
-  };
-  if ((launchCleanupBackoffUntil.get(channelId) || 0) > Date.now()) {
-    return result;
-  }
-
-  try {
-    /*
-     * Activityを起動したチャンネルだけを走査します。
-     * サーバー全体を検索しないので、負荷と誤削除を抑えます。
-     * Discord APIの上限は1回100件です。
-     */
-    const response =
-      await discordRest(
-        `/channels/${channelId}/messages?limit=100`
-      );
-
-    if (!response.ok) {
-      console.warn(
-        "ことばル起動カード走査失敗:",
-        channelId,
-        response.status
-      );
-
-      if (response.status === 429) {
-        const seconds = Number(response.headers.get("retry-after") || 60);
-        launchCleanupBackoffUntil.set(channelId, Date.now() + Math.max(60_000, seconds * 1000));
-      }
-      if (response.status === 401 || response.status === 403) {
-        launchCleanupBackoffUntil.set(channelId, Date.now() + 15 * 60_000);
-        console.warn("起動カード走査を15分停止。Bot Tokenまたは対象チャンネルの閲覧・履歴権限を確認してください。");
-      }
-      return result;
-    }
-
-    const messages =
-      await response.json();
-
-    result.scanned =
-      Array.isArray(messages)
-        ? messages.length
-        : 0;
-
-    /*
-     * DiscordのDISCORD_LAUNCH_ACTIVITYが作ったカードは
-     * 「ことばルApplicationに紐づくInteraction由来メッセージ」
-     * として判定します。
-     *
-     * type === 20 だけに頼らないのが重要です。
-     * Discordの返却形式が変わった場合でも、application_id と
-     * interaction_metadata / interaction を使って識別できます。
-     *
-     * Previewは通常のBot投稿なので interaction_metadata がなく、
-     * この条件には入りません。
-     */
-    const launchMessages =
-      messages.filter(
-        (message) =>
-          isKotobaruLaunchCardMessage(
-            message
-          )
-      );
-
-    /*
-     * 該当0件でも必ずログを残します。
-     * これで「awake自体が来ていない」のか
-     * 「走査したがカードを識別できない」のかを切り分けられます。
-     */
-    console.log(
-      `ことばル起動カード走査: channel=${channelId} / 走査${result.scanned}件 / 該当${launchMessages.length}件`
-    );
-
-    if (
-      launchMessages.length === 0
-    ) {
-      const diagnostic =
-        messages
-          .slice(0, 12)
-          .map(
-            summarizeKotobaruMessageForLog
-          );
-
-      console.log(
-        "ことばル起動カード診断:",
-        JSON.stringify(
-          diagnostic
-        )
-      );
-    }
-
-    result.matched =
-      launchMessages.length;
-
-    for (
-      const message of
-      launchMessages
-    ) {
-      const deleteResponse =
-        await discordRest(
-          `/channels/${channelId}/messages/${message.id}`,
-          {
-            method:
-              "DELETE",
-          }
-        );
-
-      if (
-        deleteResponse.ok ||
-        deleteResponse.status ===
-          404
-      ) {
-        result.deleted += 1;
-
-        console.log(
-          `ことばル起動カード削除: ${message.id}`
-        );
-
-        continue;
-      }
-
-      if (
-        deleteResponse.status ===
-          403
-      ) {
-        result.forbidden = true;
-        launchCleanupBackoffUntil.set(channelId, Date.now() + 15 * 60_000);
-        console.warn(`ことばル起動カード削除権限不足: ${message.id}`);
-        console.warn("対象チャンネルでBotに「メッセージの管理」を付与してください。権限修正まで削除を再試行しません。");
-        break;
-      }
-
-      console.warn(
-        "ことばル起動カード削除失敗:",
-        message.id,
-        deleteResponse.status,
-        await deleteResponse
-          .text()
-          .catch(
-            () => ""
-          )
-      );
-    }
-
-    if (
-      result.matched > 0
-    ) {
-      console.log(
-        `ことばル起動カード整理完了: 走査${result.scanned}件 / 該当${result.matched}件 / 削除${result.deleted}件`
-      );
-    }
-
-    return result;
-  } catch (error) {
-    console.warn(
-      "ことばル起動カード整理に失敗しました:",
-      error
-    );
-
-    return result;
-  }
-}
-
-function scheduleKotobaruLaunchCleanup(
-  channelId
-) {
-  if (
-    typeof channelId !==
-      "string" ||
-    !channelId
-  ) {
-    return;
-  }
-
-  console.log(
-    `ことばル起動カード整理を予約: channel=${channelId}`
-  );
-
-  const now =
-    Date.now();
-
-  const scheduledUntil =
-    launchCleanupScheduledUntil.get(
-      channelId
-    ) || 0;
-
-  /*
-   * ほぼ同時に複数人がActivityを開いた場合でも、
-   * 同じチャンネルを何重にも走査しません。
-   */
-  if (
-    scheduledUntil > now
-  ) {
-    return;
-  }
-
-  const windowMs =
-    25000;
-
-  launchCleanupScheduledUntil.set(
-    channelId,
-    now + windowMs
-  );
-
-  /*
-   * Renderが起きた直後に1回。
-   * Discord側で起動カード生成が少し遅れるケースに備えて、
-   * 4秒・12秒・25秒後にも再確認します。
-   */
-  const delays = [
-    0,
-    7000,
-  ];
-
-  for (
-    const delay of delays
-  ) {
-    setTimeout(
-      () => {
-        cleanupOldKotobaruLaunchMessages(
-          channelId
-        ).catch(
-          () => null
-        );
-      },
-      delay
-    );
-  }
-
-  setTimeout(
-    () => {
-      const current =
-        launchCleanupScheduledUntil.get(
-          channelId
-        );
-
-      if (
-        current &&
-        current <=
-          Date.now()
-      ) {
-        launchCleanupScheduledUntil.delete(
-          channelId
-        );
-      }
-    },
-    windowMs + 1000
-  );
-}
 
 async function refreshLatestKotobaruPreviewFromD1(
   guildId,
@@ -7384,101 +6521,26 @@ async function refreshLatestKotobaruPreviewFromD1(
   }
 }
 
-/* Activityの起動時に集計を救済しますが、連続起動でDiscord APIを連打しません。 */
-const kotobaruCatchupCooldown = new Map();
-function scheduleKotobaruCatchupForGuild(guildId) {
-  const now = Date.now();
-  if (now - (kotobaruCatchupCooldown.get(guildId) || 0) < 30 * 60_000) return;
-  kotobaruCatchupCooldown.set(guildId, now);
-  void runYesterdaySummariesForAllGuildsFromD1(guildId)
-    .then((results) => console.log(`ことばル起動時の未投稿集計: guild=${guildId} ${JSON.stringify(results)}`))
-    .catch((error) => console.warn("ことばル起動時の未投稿集計失敗:", String(error?.message || error)));
-}
-
-app.post(
-  "/api/kotobaru/awake",
-  async (req, res) => {
-    const guildId =
-      req.body?.guildId;
-
-    const channelId =
-      req.body?.channelId;
-
-    if (
-      typeof guildId !==
-        "string" ||
-      !guildId
-    ) {
-      return res
-        .status(400)
-        .json({
-          error:
-            "guildId is required",
-        });
-    }
-
-    console.log(
-      `ことばル awake受信: guild=${guildId} / activityChannel=${channelId || "なし"}`
-    );
-
-    /*
-     * 起動応答をDiscord日次集計やPreview更新で待たせません。
-     * Render起床直後でもまず200を返し、重い同期処理は後ろで実行します。
-     */
-    res.json({
-      ok: true,
-      gatewayReady:
-        kotobaruBot.isReady(),
-      gatewayConnecting:
-        kotobaruGatewayConnecting,
-      discordRestViaWorker:
-        Boolean(
-          KOTOBARU_DATA_URL &&
-          KOTOBARU_DATA_INTERNAL_SECRET
-        ),
-    });
-
-    // 起動元の削除予約は設定取得・Discord API・Preview処理を一切待たない。
-    if (typeof channelId === "string" && channelId) {
-      scheduleKotobaruLaunchCleanup(channelId);
-    }
-    // 設定された表示先が別の場合だけ追加整理する（非同期・独立）。
-    void getKotobaruGuildConfig(guildId).then((config) => {
-      if (config?.summaryChannelId && config.summaryChannelId !== channelId) {
-        scheduleKotobaruLaunchCleanup(config.summaryChannelId);
-      }
-    }).catch((error) => {
-      console.warn("ことばル起動カード整理用設定取得失敗:", String(error?.message || error));
-    });
-    scheduleKotobaruCatchupForGuild(guildId);
-    void refreshLatestKotobaruPreviewFromD1(guildId, jstDateKey()).catch((error) =>
-      console.warn("ことばル起動時Preview確認失敗:", String(error?.message || error)));
+// 旧 /awake はPreview再同期専用。起動カードの削除と日次投稿はWorkerが行う。
+app.post("/api/kotobaru/awake", async (req, res) => {
+  const guildId = req.body?.guildId;
+  const sessionToken = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+  if (typeof guildId !== "string" || !/^\d{15,25}$/.test(guildId)) {
+    return res.status(400).json({ error: "invalid guildId" });
   }
-);
-
-/* =========================================================
- * 毎日0:05（Renderが稼働している場合の補助Cron）
- * Cloudflare Worker側もwrangler.jsoncで 5 15-21 * * * へ変更する。
- * ======================================================= */
-
-cron.schedule(
-  "5 0 * * *",
-  () => {
-    runYesterdaySummariesForAllGuildsFromD1()
-      .catch(
-        (error) => {
-          console.error(
-            "ことばル日次集計エラー:",
-            error
-          );
-        }
-      );
-  },
-  {
-    timezone:
-      "Asia/Tokyo",
+  if (!sessionToken) return res.status(401).json({ error: "Kotobaru session required" });
+  try {
+    const verified = await kotobaruDataInternal("/internal/verify-awake", {
+      method: "POST", body: JSON.stringify({ sessionToken, guildId }), signal: AbortSignal.timeout(8_000),
+    });
+    if (!verified.ok) return res.status(verified.status === 403 ? 403 : 503).json({ error: "awake verification failed" });
+    res.json({ ok: true, gatewayReady: kotobaruBot.isReady() });
+    void refreshLatestKotobaruPreviewFromD1(guildId, jstDateKey());
+  } catch (error) {
+    console.warn("ことばル起動確認失敗:", error?.name);
+    if (!res.headersSent) return res.status(503).json({ error: "preview awake unavailable" });
   }
-);
+});
 
 /* =========================================================
  * ことばルBot起動
@@ -7594,6 +6656,13 @@ async function startKotobaruBot() {
         : "未設定または不正"
     }`
   );
+
+  kotobaruBot.on(Events.ShardDisconnect, (event, shardId) => {
+    console.warn("ことばルGateway切断", { shardId, code: event?.code ?? null });
+  });
+  kotobaruBot.on(Events.ShardResume, (shardId, replayedEvents) => {
+    console.log("ことばルGateway再接続", { shardId, replayedEvents });
+  });
 
   kotobaruBot.once(
     Events.ClientReady,
