@@ -5278,6 +5278,11 @@ const kotobaruCommands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
 
   new SlashCommandBuilder()
+    .setName("ことばル招待確認")
+    .setDescription("このチャンネルのことばルのゲーム招待を確認・整理します")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
+
+  new SlashCommandBuilder()
     .setName(
       "ことばルd1移行"
     )
@@ -5444,6 +5449,27 @@ kotobaruBot.on(
         await interaction.editReply(updated
           ? "今日の保存済み盤面からプレビューを表示先に同期しました。"
           : `プレビュー未更新（${diagnostic?.stage || "unknown"} / HTTP ${diagnostic?.status ?? "—"} / ${diagnostic?.error || "—"}）`);
+        return;
+      }
+
+      if (interaction.commandName === "ことばル招待確認") {
+        if (!interaction.guildId || !interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels)) return;
+        await interaction.deferReply({ ephemeral: true });
+        const response = await kotobaruDataInternal("/internal/launch-check", {
+          method: "POST", signal: AbortSignal.timeout(25_000),
+          body: JSON.stringify({ guildId: interaction.guildId, channelId: interaction.channelId }),
+        });
+        if (!response.ok) {
+          await interaction.editReply(`招待整理の受付失敗（Worker HTTP ${response.status}）`);
+          return;
+        }
+        const data = await response.json();
+        const result = data.results?.[0];
+        await interaction.editReply(!result
+          ? "招待整理は処理中または再試行待ちです。Cloudflare Workerログを確認してください。"
+          : result.stage
+            ? `招待整理失敗（${result.stage} / HTTP ${result.status ?? "—"} / ${result.source || "—"} / ${result.detail || "—"}）`
+            : `招待整理結果　走査 ${result.scanned}件・該当 ${result.matched}件・削除 ${result.removed}件`);
         return;
       }
 
@@ -6278,7 +6304,7 @@ app.get(
           getKotobaruEncryptionKey()
         ),
 
-      maintenanceVersion: "15.6",
+      maintenanceVersion: "15.7",
       summaryExecution: "cloudflare-worker",
 
       d1Configured:
@@ -6366,7 +6392,7 @@ app.get(
           KOTOBARU_DATA_URL &&
           KOTOBARU_DATA_INTERNAL_SECRET
         ),
-      maintenanceVersion: "15.6",
+      maintenanceVersion: "15.7",
       summaryExecution: "cloudflare-worker",
       d1ConfigReady,
       latestPreview: (() => {
