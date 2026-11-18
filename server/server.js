@@ -6268,6 +6268,68 @@ app.post("/api/kotobaru/daily-summary", (_req, res) => {
   res.status(410).json({ error: "daily summary now runs in kotobaru-data Worker" });
 });
 
+// The Worker owns the Discord post. This read-only renderer restores the
+// two existing v15.2 image layouts without moving the daily job back to Render.
+app.get("/api/kotobaru/daily-summary-images", (_req, res) => {
+  res.set("cache-control", "no-store").status(204).end();
+});
+
+function canRenderKotobaruDailyImages({ guildId, date, time }, signature, now = Date.now()) {
+  if (!KOTOBARU_DATA_INTERNAL_SECRET || typeof guildId !== "string" || !/^\d{15,25}$/.test(guildId) ||
+      typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
+      typeof time !== "string" || !/^\d{13}$/.test(time) || Math.abs(now - Number(time)) > 60_000 ||
+      typeof signature !== "string" || !/^[a-f0-9]{64}$/.test(signature)) return false;
+  const canonical = `kotobaru-daily-images/v1\n${guildId}\n${date}\n${time}`;
+  const expected = crypto.createHmac("sha256", KOTOBARU_DATA_INTERNAL_SECRET).update(canonical).digest();
+  if (!crypto.timingSafeEqual(expected, Buffer.from(signature, "hex"))) return false;
+  // Do not open the current puzzle, or the previous day's puzzle before 00:05 JST.
+  const minute = (Math.floor(now / 60_000) + 9 * 60) % 1440;
+  const lower = jstDateKey(new Date(now - 7 * 86_400_000));
+  const upper = jstDateKey(new Date(now - (minute < 5 ? 86_400_000 : 0)));
+  return Number.isFinite(Date.parse(date + "T00:00:00Z")) && date >= lower && date < upper;
+}
+
+function encodeKotobaruDailyImages(preview, words) {
+  if (preview.byteLength + words.byteLength + 4 > 6 * 1024 * 1024) return null;
+  const prefix = Buffer.alloc(4);
+  prefix.writeUInt32BE(preview.byteLength, 0);
+  return Buffer.concat([prefix, preview, words]);
+}
+
+app.post("/api/kotobaru/daily-summary-images", async (req, res) => {
+  res.set("cache-control", "no-store");
+  const input = req.body || {};
+  if (!canRenderKotobaruDailyImages(input, req.headers["x-kotobaru-image-signature"])) {
+    return res.status(403).json({ error: "invalid image render request" });
+  }
+  try {
+    const data = await loadKotobaruD1Day(input.guildId, input.date);
+    const rows = Array.isArray(data.entries) ? data.entries : [];
+    if (!rows.length || rows.length > 24) return res.status(422).json({ error: "unsupported result size" });
+    // Keep the old board/word-image rule: use completed attempts and then
+    // timestamps to order the players, with the successful answers first.
+    const entries = [...rows].sort((a, b) =>
+      Number(Boolean(b.won)) - Number(Boolean(a.won)) ||
+      (a.won && b.won ? Number(a.attempts ?? 99) - Number(b.attempts ?? 99) : 0) ||
+      Number(Boolean(b.finished)) - Number(Boolean(a.finished)) ||
+      Number(a.savedAt || a.updatedAt || 0) - Number(b.savedAt || b.updatedAt || 0)
+    ).map((row) => ({
+      ...row, historical: true,
+      pattern: Array.isArray(row.pattern) ? row.pattern.slice(0, 6) : [],
+      guessesDecrypted: Array.isArray(row.guessesDecrypted) ? row.guessesDecrypted.slice(0, 6).map((word) => String(word).slice(0, 24)) : [],
+    }));
+    const puzzle = Math.max(1, ...entries.map((row) => Number(row.puzzleNumber) || 1));
+    const preview = await renderKotobaruPreviewPng(entries, puzzle, input.guildId);
+    const words = await renderKotobaruWordsPng(entries, puzzle, input.guildId);
+    const encoded = encodeKotobaruDailyImages(preview, words);
+    if (!encoded) return res.status(413).json({ error: "images too large" });
+    return res.type("application/octet-stream").send(encoded);
+  } catch (error) {
+    console.warn("ことばル日次画像の生成失敗:", error?.name || "Error");
+    return res.status(503).json({ error: "image renderer unavailable" });
+  }
+});
+
 /* =========================================================
  * ヘルスチェック
  * ======================================================= */
@@ -6304,7 +6366,7 @@ app.get(
           getKotobaruEncryptionKey()
         ),
 
-      maintenanceVersion: "15.7",
+      maintenanceVersion: "15.9",
       summaryExecution: "cloudflare-worker",
 
       d1Configured:
@@ -6392,7 +6454,7 @@ app.get(
           KOTOBARU_DATA_URL &&
           KOTOBARU_DATA_INTERNAL_SECRET
         ),
-      maintenanceVersion: "15.7",
+      maintenanceVersion: "15.9",
       summaryExecution: "cloudflare-worker",
       d1ConfigReady,
       latestPreview: (() => {
