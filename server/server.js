@@ -4039,7 +4039,7 @@ function previewRetryDelay(response) {
 function previewFailure(guildId, date, sessionId, stage, status, detail = "", retryAfter = 0) {
   const error = String(detail || "").slice(0, 350);
   setPreviewDiagnostic(guildId, date, sessionId, {
-    ok: false, stage, status, error,
+    ok: false, stage, status, error, retryAfterMs: Number(retryAfter) || 0,
   });
   console.warn(`ことばルPreview失敗: stage=${stage} HTTP=${status || "?"} guild=${guildId} session=${sessionId} detail=${error}`);
   if (!status || status === 429 || status >= 500) {
@@ -6268,6 +6268,38 @@ app.post("/api/kotobaru/daily-summary", (_req, res) => {
   res.status(410).json({ error: "daily summary now runs in kotobaru-data Worker" });
 });
 
+function canRunKotobaruPreviewJob({ guildId, date, sessionId, puzzleNumber, time }, signature, now = Date.now()) {
+  if (!KOTOBARU_DATA_INTERNAL_SECRET || typeof guildId !== "string" || !/^\d{15,25}$/.test(guildId)
+    || typeof date !== "string" || date !== jstDateKey(new Date(now))
+    || typeof sessionId !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(sessionId)
+    || !Number.isSafeInteger(puzzleNumber) || puzzleNumber < 1
+    || typeof time !== "string" || !/^\d{13}$/.test(time) || Math.abs(now - Number(time)) > 60_000
+    || typeof signature !== "string" || !/^[a-f0-9]{64}$/.test(signature)) return false;
+  const canonical = ["kotobaru-preview-job/v1", guildId, date, sessionId, puzzleNumber, time].join("\n");
+  const expected = crypto.createHmac("sha256", KOTOBARU_DATA_INTERNAL_SECRET).update(canonical).digest();
+  return crypto.timingSafeEqual(expected, Buffer.from(signature, "hex"));
+}
+
+app.post("/api/kotobaru/preview-job", async (req, res) => {
+  res.set("cache-control", "no-store");
+  const input = req.body || {};
+  if (!canRunKotobaruPreviewJob(input, req.headers["x-kotobaru-preview-signature"])) {
+    return res.status(403).json({ updated: false, stage: "preview_job_auth" });
+  }
+  const { guildId, date, sessionId, puzzleNumber } = input;
+  try {
+    const updated = await upsertKotobaruLiveCardFromD1(guildId, date, puzzleNumber, sessionId);
+    if (updated) return res.json({ updated: true });
+    const detail = kotobaruPreviewDiagnostics.get(previewDiagnosticKey(guildId, date, sessionId));
+    const status = detail?.status >= 400 && detail?.status <= 599 ? detail.status : 503;
+    return res.status(status).json({ updated: false, stage: detail?.stage || "preview_waiting",
+      status, retryAfterMs: detail?.retryAfterMs || 0 });
+  } catch (error) {
+    console.warn("ことばルPreview自動ジョブ失敗:", error?.name || "Error");
+    return res.status(503).json({ updated: false, stage: "preview_job_exception" });
+  }
+});
+
 // The Worker owns the Discord post. This read-only renderer restores the
 // two existing v15.2 image layouts without moving the daily job back to Render.
 app.get("/api/kotobaru/daily-summary-images", (_req, res) => {
@@ -6366,7 +6398,7 @@ app.get(
           getKotobaruEncryptionKey()
         ),
 
-      maintenanceVersion: "15.9",
+      maintenanceVersion: "15.10",
       summaryExecution: "cloudflare-worker",
 
       d1Configured:
@@ -6454,7 +6486,7 @@ app.get(
           KOTOBARU_DATA_URL &&
           KOTOBARU_DATA_INTERNAL_SECRET
         ),
-      maintenanceVersion: "15.9",
+      maintenanceVersion: "15.10",
       summaryExecution: "cloudflare-worker",
       d1ConfigReady,
       latestPreview: (() => {
